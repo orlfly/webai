@@ -51,7 +51,7 @@ JS 执行只发生在 WebKit 的 JavaScriptCore 内。Rust 侧不嵌第二个 JS
 每个 session（ACP `session_id` 或本地聊天）对应一个长生命周期 `AgentSession`，持有：
 
 1. 会话转录（messages 历史）；
-2. JSONL 追加式持久化——写后即 flush，崩溃最多损失最后一条截断记录，恢复时跳过截断行续跑（落盘路径 `~/.webai/sessions/`）；
+2. JSONL 追加式持久化——写后即 flush，崩溃最多损失最后一条截断记录，恢复时跳过截断行续跑（落盘路径 `~/.webai/sessions/`）；**归属唯一：JSONL 会话日志由 `webai-memory` 提供（§4.4），`AgentSession` 只持有写入句柄，不自行实现 appender**；
 3. 可选的跨会话共享记忆句柄（向量 + 图双通道 MemoryStore）。
 
 - 理由：会话是产品层三形态（形态一 TUI / 形态二 ACP / 形态三 `--serve` 服务模式，见 PRODUCT-DESIGN §3）统一的抽象单位，把它做成一等对象后，三种前端形态复用同一套会话生命周期与恢复语义。
@@ -148,31 +148,35 @@ webai-ng/
 │   ├── webai-bridge-cxx/ # #[cxx::bridge] 绑定到 cog/libwpe 封装 C++（唯一含 C++ 的 crate）
 │   ├── webai-agent/      # AgentLoop、AgentSession、plan、script_memory、history_summariser
 │   ├── webai-acp/        # ACP JSON-RPC over WS / 行分隔 TCP 服务端
-│   ├── webai-tui/        # ratatui + crossterm 前端，含终端图像（Kitty/iTerm2/Sixel）
+│   └── webai-tui/        # ratatui + crossterm 前端，含终端图像（Kitty/iTerm2/Sixel）
 └── bins/
     └── webai/            # 主二进制：默认起 TUI；--serve 起 ACP；--headless 无界面
 ```
 
 ### 3.2 分层依赖规则（强制）
 
-依赖只能沿以下偏序自左向右：
+依赖只能沿以下偏序自左向右（`{a, b}` 表示并列、无相互依赖；箭头 `x < y` 表示 y 依赖 x）：
 
 ```
-protocol < config < {llm, memory, embedding, script}
-{script, webkit} < bridge < agent < {acp, tui} < bins/webai
+protocol < config < {llm, embedding, script}    # 三个独立能力 crate 平行、互不依赖
+embedding < memory                              # memory 的向量检索依赖 embedding 生成向量
+{script, webkit} < bridge                       # bridge 组合 script 与 webkit（二者间无依赖边）
+{llm, memory, bridge} < agent                   # agent 直接依赖 llm/memory（规划/修复/脚本记忆），经工具层调 bridge
+agent < {acp, tui} < bins/webai                 # 前端共享 agent 公共接口；webai 二进制装配全部
 ```
 
-（`{a, b}` 表示并列、无相互依赖；`script` 与 `webkit` 之间无依赖边，二者都只被 `bridge` 组合，见下表。）
+覆盖说明：`agent` 对 `embedding` 的依赖经 `memory` 间接达成（不含直接调用边）；`acp` / `tui` 之间无相互依赖，二者都可被 `bins/webai` 组合（同一进程内 TUI 与 ACP 服务共存，见 §4.10 共享 registry）。
 
 含义与检查手段：
 
 | 规则 | 说明 |
 |---|---|
 | `webai-protocol` 零依赖 | 只依赖 serde；所有 crate 依赖它共享 wire 类型，杜绝类型漂移 |
-| `{llm, memory, embedding, script}` 互不依赖 | 四个核心能力 crate 平行，组合发生在上层（agent / bridge） |
+| `{llm, embedding, script}` 互不依赖 | 三个能力 crate 平行；`memory` 是唯一依赖 `embedding` 的上层（向量检索），组合发生在上层（agent / bridge） |
+| `agent` 对核心服务依赖摊平 | `agent < llm`（规划/修复/summariser）、`agent < memory`（脚本记忆/会话日志）；`embedding` 经 `memory` 间接 |
 | `webkit` 不依赖 `script` | 桥只认 JS 文本，不感知动词语义（定论一）；`bridge` 负责组合 script + webkit |
 | `agent` 不被任何前端依赖反向引用 | acp / tui 只依赖 agent 的公共接口 |
-| C++ 隔离 | 只有 `webai-bridge-cxx` 含 C++；其余 crate Rust-only，`cargo build --no-default-features` 必须可编译可测试 |
+| C++ 隔离 | 只有 `webai-bridge-cxx` 含 C++；`legacy_cpp` 是 **opt-in feature，default features 不含它**；`cargo build --no-default-features` 必须可编译可测试 |
 
 强制执行：CI 中用 cargo-deny（ban 多版本、限制依赖来源）+ 自写分层检查脚本（解析 crate graph，断言上述偏序），违规即构建失败。
 
@@ -199,7 +203,7 @@ protocol < config < {llm, memory, embedding, script}
 
 ### 4.4 webai-memory
 - `SharedMemoryStore`：图后端（Kuzu）+ 向量检索（HNSW）抽象。
-- 会话日志：`~/.webai/sessions/<session_id>.jsonl`，`record_user_prompt / record_step / record_finished / record_error / close`，每次 write+flush。恢复算法：`recovery_from_persisted_step` 跳过最后一条可能截断的行。
+- 会话日志：`~/.webai/sessions/<session_id>.jsonl`，`record_user_prompt / record_step / record_finished / record_error / close`，每次 write+flush。**JSONL 会话日志的归属唯一确定在 webai-memory**：AgentSession 只持有其写入句柄（§1 定论五 / §4.9），不做第二套 appender。恢复算法：`recovery_from_persisted_step` 跳过最后一条可能截断的行。
 - 脚本记忆条目（`MemoryWriteKind::Script`）：字段 `task/verb/url/script`，标签 `script:{verb}`、`session:{id}`；检索接口 `recall_scripts(task)`。
 
 ### 4.5 webai-script（script_author 的独立化）
@@ -218,7 +222,7 @@ protocol < config < {llm, memory, embedding, script}
 - 无 FFI 环境（开发机）返回结构化 `CogLaunch` 错误，测试用 canned response 注入路径覆盖 dispatch 全链路。
 
 ### 4.7 webai-bridge-cxx
-- 唯一允许包含 C++ 的 crate：cxx bridge 到 cog/WPEBackend-fdo 封装。
+- 唯一允许包含 C++ 的 crate：cxx bridge 到 cog/WPEBackend-fdo 封装。`legacy_cpp` 是 opt-in feature，**default features 不包含它**（默认构建 Rust-only stub，可编译可测试）。
 - feature `legacy_cpp` 之外不链接任何系统 WebKit；CI 有 `--no-default-features` 构建保证 Rust-only 可编译可测试。
 
 ### 4.8 webai-bridge（jcode_host 等价）
@@ -235,7 +239,7 @@ protocol < config < {llm, memory, embedding, script}
   - **脚本记忆复用**：调度前 `recall_scripts`，命中同动词则直接执行并标记 `reused_script: true`；失败则一次 LLM 修复（上下文见 §1 定论四）。
   - 守卫：`max_steps`（默认 30，超限产出结构化 `max_steps_exceeded` 事件）、`duplicate_threshold`（默认 2，相同观察即判卡死）。
   - `history_summariser`：长会话压缩。
-- `AgentSession`：转录（`Mutex<Vec<ChatMessage>>`）、`Arc<AgentLoop>`、JSONL appender、可选 `Arc<SharedMemoryStore>`。
+- `AgentSession`：转录（`Mutex<Vec<ChatMessage>>`）、`Arc<AgentLoop>`、JSONL 写入句柄（复用 webai-memory 会话日志组件，见 §4.4）、可选 `Arc<SharedMemoryStore>`。
 - 工具注册表：`Tool` trait + 五个核心工具（browser/memory/filesystem/llm/acp_notify）+ terminate。文件工具必须有路径沙箱（沿用现有 `fs_bridge` 的校验逻辑）。
 
 ### 4.10 webai-acp
