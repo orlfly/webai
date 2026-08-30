@@ -1,6 +1,6 @@
 # Webai-AI 产品设计说明书（webai-ng，工作稿）
 
-> 版本：1.2（2026-08-30，修订版：落实任务 #15 评审 M-1/m-1/m-2）
+> 版本：1.3（2026-08-30，修订版：落实任务 #16 评审 M-1/m-1/m-2）
 > 角色：产品设计 agent 产出
 > 源文档：`docs/PRODUCT-DESIGN.md`（v1.0，唯一产品依据）
 > 配套文档：`docs/architecture/ARCHITECTURE.md`（架构设计说明书，另行编写与维护）
@@ -517,7 +517,8 @@ llama.cpp 均可，一次配置全局生效。
 $ webai
 ┌ AI 浏览器 ────────────────────────────────────────┐
 │ 你: 打开新浪财经，汇总今天头条                      │
-│ ├─ 思考 · 用户要的是头条汇总，先导航到新浪财经首页   │
+│ ├─ 计划 · navigate finance.sina.com.cn → get_text … │
+│ ├─ 思考 · 用户要的是头条汇总，已产出计划，先导航     │
 │ ├─ 操作 · navigate https://finance.sina.com.cn      │
 │ ├─ 观察 · 页面已加载，标题"新浪财经_新浪网"  [截图] │
 │ ├─ 思考 · 找到今日头条区块，抽取 10 条              │
@@ -529,6 +530,8 @@ $ webai
 
 验收核对点：
 - 首次使用无需任何配置（默认 LLM profile 开箱即用，见 §7）。
+- 多动作指令（navigate + get_text）先展示 `计划` 行再执行（对齐 FR-1
+  `create_plan` 触发），计划不静默跳过。
 - 每步三元组（思考/操作/观察）流式逐行出现，不"等全部完成再显示"。
 - 关键动作后自动附带截图（主张③：可核对）。
 - 交互约定全部生效（Enter/↑↓/PgUp/PgDn/Esc/Ctrl+C，见 §3.1）。
@@ -541,16 +544,22 @@ $ webai
 ```
 你: 打开新浪财经，汇总今天头条
 ├─ 操作 · [复用记忆脚本 navigate→extract]（历史 2 次成功，上次 2026-08-30）
-│         replay 参数：url=https://finance.sina.com.cn
-├─ 观察 · 列表就绪（复用校验通过，无需 LLM 推理）     [截图]
+│         replay 参数：url=https://finance.sina.com.cn（脚本回放 0 次 LLM 调用）
+├─ 观察 · 列表就绪（复用校验通过）                  [截图]
 └─ 完成 · 今日头条汇总（10 条，含链接）
-        · 标记：本次复用记忆脚本，LLM 调用 1 次（首次为 6 次）
+        · 标记：本次复用记忆脚本，LLM 调用 1 次（仅最终总结，首次为 6 次，
+          占比 17% ≤ 30%）
 ```
 
-验收核对点（对应 §6 效率指标）：
+说明：记忆命中最少可到 **0 次 LLM 调用**（脚本纯回放、产物即脚本输出）；上例
+的 1 次是"最终总结"这类需要合成答案的任务所保留的最小调用。是否必须保留该
+调用由任务画像决定，不作为验收断言。
+
+验收核对点（对应 §6 M-2）：
 - 界面显式出现 `[复用记忆脚本 ...]` 标记（TUI）或事件 `reused_script=true`
   （ACP），二者不可缺失。
-- 耗时口径：第二次完成时间 ≤ 首次的 30% 预算（LLM 调用次数为铁证）。
+- **第二次 LLM 调用总数 ≤ 首次的 30%**（口径见 §6 M-2：包含 planning/repair
+  调用、采样 ≥30 个任务、取中位数）。完成时间仅作观察项，不作验收断言。
 
 ### 旅程 C：失败自愈
 
@@ -580,21 +589,16 @@ $ webai
 
 目标：证形态二/三——宿主程序化调用浏览器能力，拿到流式事件。
 
-协议事件示例（`webai --serve`，宿主为 jcode 插件）：
+协议事件示例（`webai --serve`，宿主为 jcode 插件；`→`/`←` 为传输方向标记，
+`…` 为略写——去掉标记后每行为一行合法 JSON，即行分隔 TCP 的传输格式）：
 
-```json
+```text
 → {"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}
 ← {"jsonrpc":"2.0","id":1,"result":{"sessionId":"s-3f89x1"}}
-
-→ {"jsonrpc":"2.0","id":2,"method":"session/prompt",
-   "params":{"sessionId":"s-3f89x1",
-             "prompt":"把当前页面标题和前 3 条要点发给我"}}
-← 流式事件：
-   {"method":"session/event","params":{"event":"step","thought":"先读取标题…",
-     "tool":{"verb":"get_title"},"observation":"…","image":"data:image/png;base64,…"}}
-   {"method":"session/event","params":{"event":"step","reused_script":true,…}}
-   {"method":"session/event","params":{"event":"done","result":"…3 条要点…"}}
-
+→ {"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"s-3f89x1","prompt":"把当前页面标题和前 3 条要点发给我"}}
+← {"method":"session/event","params":{"event":"step","sessionId":"s-3f89x1","step_no":1,"thought":"先读取标题…","tool":{"verb":"get_title","args":{}},"observation":"…","image":"data:image/png;base64,…","started_at":"2026-08-30T11:00:00Z"}}
+← {"method":"session/event","params":{"event":"step","sessionId":"s-3f89x1","step_no":2,"reused_script":true,"thought":"…","tool":{"verb":"get_text","args":{}},"observation":"…","started_at":"2026-08-30T11:00:01Z"}}
+← {"method":"session/event","params":{"event":"done","sessionId":"s-3f89x1","result":"…3 条要点…"}}
 → {"jsonrpc":"2.0","id":3,"method":"session/close","params":{"sessionId":"s-3f89x1"}}
 ← {"jsonrpc":"2.0","id":3,"result":{"ok":true}}
 ```
