@@ -1,2 +1,0 @@
-# webai
-rust ai browser
