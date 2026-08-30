@@ -226,7 +226,7 @@ agent < {acp, tui} < bins/webai                 # 前端共享 agent 公共接�
 - 全 crate 禁止 IO，测试 = 模板快照 + 参数注入 + 错误路径。
 
 ### 4.6 webai-webkit（WebkitBridge）
-- 持有 `*mut WebkitView`（经 cxx crate），`Mutex` 串行化所有视图访问。
+- 提供 `WebkitViewPool`（§6.1 资源模型）：每 view 一把 `Mutex` 串行化该视图访问，跨 view 并行；池负责视图的分配/复用/上限与 BrowserContext 隔离。
 - `open(url)` / `evaluate_javascript(src, timeout_ms)` / `wait_for_load` / `inject_user_script`（document-start）/ `screenshot() -> PNG`。
 - FFI trampoline 接收 `WEBKIT_LOAD_FINISHED -> bridge.page.load` 通知，更新 `last_load_uri` 并唤醒 `oneshot` 订阅者。
 - **BUNDLE_SCRIPT_ORDER**（顺序敏感，必须保持）：`bridge-client.js`（首，安装 `window.__webkitBridge`）→ `parser/index.js` → `accessibility/index.js` → `dom.js` → `selector.js` → `events.js` → `network.js` → `storage.js` → `actions/{navigate,history,interact,extract,screenshot,composite}.js` → `legacy/playwright-shim.js`（末）。这些脚本安装 `WebkitAiDom / WebkitAiSelector / WebkitAiActions` 等构建块，动词脚本在其上组合。**新版本必须把页面侧构建块作为一等资产迁移**（建议移到 `page-bundle/` 独立目录并加 TS 类型与单测）。
@@ -307,15 +307,27 @@ execute 或 verify 任一失败 → 收集 `{失败脚本, 错误(含 JS 异常�
 ## 6. 并发与线程模型
 
 - tokio 多线程 runtime（workspace 统一 features：rt-multi-thread/macros/time/net/io-util/sync/process/io-std/fs/signal）。
-- **WebKit view 单线程亲和**：所有 FFI 调用经同一 `Mutex` 串行；load 事件用 oneshot 广播给异步等待者。**不允许**在 tokio worker 上直接阻塞 FFI，用 `spawn_blocking` 或专用桥线程。
-- 会话间天然并行（每 session 独立 AgentLoop 步进）；内存后端内部自同步。
+- **WebKit view 单线程亲和（per-view）**：每个 `WebkitView` 持有独立 `Mutex`，同一 view 上所有 FFI 调用串行；**跨 view 天然并行**（对应会话级并行）。load 事件用 oneshot 广播给异步等待者。**不允许**在 tokio worker 上直接阻塞 FFI，用 `spawn_blocking` 或专用桥线程。
+- 会话间并行：每 session 独立 AgentLoop 步进，各自占用一个 view（见下方资源模型）；内存后端内部自同步。
 - 定时器/节流：TUI 渲染 tick 50ms；图像帧仅视口可见步、每次进入视口派发一次。
+
+### 6.1 多会话浏览器资源模型（view 池）
+
+对齐产品承诺（PRODUCT-DESIGN §3.2 会话隔离、M-6 内存预算）：
+
+1. **隔离单元 = 会话**：每个 session 独占一个 `WebkitView` + 独立 BrowserContext（cookie/storage 隔离，互不影响），转录与 JSONL 随会话生命周期。
+2. **view 池**：`WebkitViewPool` 管理分配/复用/上限——
+   - `session/new` 时从池中取 view；`session/close` 时归还；
+   - 空闲（无会话）view 可被新会话复用（复用仅限无状态视图外壳，BrowserContext 状态仍在会话内重建，保证 §3.2 隔离承诺）；
+   - 池容量上限 = `max_concurrent_sessions`（默认 4，可配置），由 M-6 内存预算推导：单视图常驻 ≈ 250MB（M-6 阈值 <300MB 减去 LLM/转录等固定开销后留余量）。
+3. **超出上限**：新 `session/new` 进入串行队列等待空闲 view；等待超时（默认 30s，可配置）返回结构化 `resource_exhausted` 错误，不静默失败。
+4. **崩溃恢复不变**：会话崩溃仅释放其 view，其余会话不受影响（§3.2 承诺）；恢复的会话重新向池申请 view。
 
 ## 7. 错误处理
 
 - `thiserror` 分层错误：`WebkitError`（CogLaunch/Timeout/ScriptError…）、`BrowserToolError`（缺参数等）、`LoopError`（max_steps_exceeded、duplicate_observation）。
 - 所有跨层错误必须带结构化 `error.code` + 人读 detail；stub/FFI 缺失场景要能诊断（这是现有实现特别补过的点，不要倒退）。
-- LLM 失败：有限次退避重试；记忆后端失败：降级为无记忆并打日志，不致命。
+- LLM 失败：有限次退避重试（默认最多 3 次，指数退避 0.5s → 1s → 2s，上限 8s；单次请求超时默认 120s，可经 `llm.toml` 的 `timeout` 配置）；记忆后端失败：降级为无记忆并打日志，不致命。
 
 ## 8. 配置示例（沿用 schema）
 
