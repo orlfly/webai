@@ -159,8 +159,8 @@ impl BrowserVerb {
             "evaluate" => Self::Evaluate,
             "screenshot" => Self::Screenshot,
             "accessibility_tree" => Self::AccessibilityTree,
-            "extract_text" => Self::GetText,
-            "extract_html" => Self::GetHtml,
+            "extract_text" | "get_text" => Self::GetText,
+            "extract_html" | "get_html" => Self::GetHtml,
             "download" => Self::Download,
             "snapshot" => Self::Snapshot,
             _ => Self::Evaluate,
@@ -325,7 +325,28 @@ mod tests {
             // used by script-memory entries (extract_text/extract_html).
             assert_eq!(verb.canonical_name(), storage);
             assert_eq!(BrowserVerb::from_name(storage), verb);
+            // Regression: the serde wire name must also map back to itself, not
+            // fall through to Evaluate. This was broken for get_text/get_html.
+            assert_eq!(
+                BrowserVerb::from_name(wire),
+                verb,
+                "from_name({wire:?}) must map back to {verb:?}"
+            );
         }
+    }
+
+    #[test]
+    fn from_name_maps_wire_names_for_text_and_html() {
+        // The exact regression fixed for M-1 review (#23):
+        // from_name("get_text") / from_name("get_html") previously returned
+        // Evaluate, breaking script-memory replay semantics.
+        assert_eq!(BrowserVerb::from_name("get_text"), BrowserVerb::GetText);
+        assert_eq!(BrowserVerb::from_name("get_html"), BrowserVerb::GetHtml);
+        // The legacy storage aliases still work unchanged.
+        assert_eq!(BrowserVerb::from_name("extract_text"), BrowserVerb::GetText);
+        assert_eq!(BrowserVerb::from_name("extract_html"), BrowserVerb::GetHtml);
+        // Unknown names still fall back to Evaluate (escape hatch).
+        assert_eq!(BrowserVerb::from_name("bogus_verb"), BrowserVerb::Evaluate);
     }
 
     #[test]
