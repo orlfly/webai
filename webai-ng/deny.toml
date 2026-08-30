@@ -1,0 +1,79 @@
+# ============================================================================
+# cargo-deny configuration for the webai-ng workspace
+#
+# Enforces ARCHITECTURE.md §3.2 (强制执行) and the workspace dependency policy:
+#   - ban multiple versions of the same crate wherever practical
+#   - restrict dependency sources to the crates.io registry (no git/arbitrary)
+#   - license allow-list, fail closed on anything unvetted
+#
+# cargo-deny resolves a crate's compound SPDX expression (e.g. `MIT OR
+# Apache-2.0`) against the license allow-list: a crate is allowed only when
+# every license appearing in its expression is listed. Single SPDX IDs are
+# used (rather than compound expressions) so the config is self-documenting.
+#
+# Run locally with the cargo-deny CLI (https://github.com/EmbarkStudios/cargo-deny):
+#   cargo install cargo-deny --locked
+#   cargo deny check       (from webai-ng/)
+#
+# CI invokes the same check (see .github/workflows/ci.yml).
+# ============================================================================
+
+# ---- Bans: ban multiple versions (task M1-5) ----
+[bans]
+# Duplicate versions of the same crate fail CI, except the explicit skips below
+# for distinct-major transitive lines that legitimately coexist in the resolved
+# graph (old + new consumers of one dep in the same tree).
+multiple-versions = "deny"
+
+# Keep only the latest version of each coexisting transitive line un-skipped so
+# the version-skew stays visible while a single canonical version is impossible
+# until the whole graph migrates off the older lines.
+[[bans.skip]]
+name = "getrandom"
+version = "0.2.17"
+[[bans.skip]]
+name = "getrandom"
+version = "0.3.4"
+[[bans.skip]]
+name = "linux-raw-sys"
+version = "0.4.15"
+[[bans.skip]]
+name = "r-efi"
+version = "5.3.0"
+[[bans.skip]]
+name = "rustix"
+version = "0.38.44"
+[[bans.skip]]
+name = "syn"
+version = "2.0.119"
+[[bans.skip]]
+name = "unicode-width"
+version = "0.1.14"
+[[bans.skip]]
+name = "windows-sys"
+version = "0.52.0"
+[[bans.skip]]
+name = "windows-sys"
+version = "0.59.0"
+
+# ---- Sources: crates.io only (no git / non-registry) ----
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# ---- Licenses: fail closed, allow only vetted SPDX IDs ----
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "Zlib",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
