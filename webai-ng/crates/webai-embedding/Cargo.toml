@@ -1,0 +1,11 @@
+[package]
+name = "webai-embedding"
+description = "Embedding interface + BGE-M3 adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]

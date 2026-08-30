@@ -1,0 +1,11 @@
+[package]
+name = "webai-bridge-cxx"
+description = "cxx bridge bindings to cog/libwpe C++ wrappers (only crate containing C++)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]

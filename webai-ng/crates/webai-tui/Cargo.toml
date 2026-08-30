@@ -1,0 +1,11 @@
+[package]
+name = "webai-tui"
+description = "ratatui + crossterm frontend with terminal image support (Kitty/iTerm2/Sixel)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]

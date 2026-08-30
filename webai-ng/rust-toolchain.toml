@@ -1,0 +1,9 @@
+# webai-ng build toolchain.
+#
+# Minimum supported Rust version per docs/ARCHITECTURE.md §10: `Rust 1.87+`,
+# edition 2021. rust-toolchain.toml pins the floor so the build fails loudly
+# if a too-old toolchain is used. Newer toolchains are used as-is.
+
+[toolchain]
+channel = "1.87"
+components = ["rustfmt", "clippy"]

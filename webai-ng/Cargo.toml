@@ -1,0 +1,97 @@
+# ============================================================================
+# webai-ng — cargo workspace skeleton
+#
+# Mirrors the target layout in docs/ARCHITECTURE.md §3.1 and enforces the
+# workspace-wide conventions of §3.3:
+#   - resolver = "2"
+#   - all public dependency versions centralized in [workspace.dependencies]
+#   - tokio features declared once at the workspace level
+#   - edition 2021, Rust 1.87+
+#
+# This is a standalone workspace under the webai repository's webai-ng/ dir.
+# ============================================================================
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/webai-protocol",
+    "crates/webai-config",
+    "crates/webai-llm",
+    "crates/webai-memory",
+    "crates/webai-embedding",
+    "crates/webai-script",
+    "crates/webai-bridge",
+    "crates/webai-webkit",
+    "crates/webai-bridge-cxx",
+    "crates/webai-agent",
+    "crates/webai-acp",
+    "crates/webai-tui",
+    "bins/webai",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+authors = ["webai team"]
+publish = false
+
+[workspace.dependencies]
+# Async runtime — features unified at workspace level (ARCHITECTURE.md §3.3).
+tokio = { version = "1.42", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "net",
+    "io-util",
+    "sync",
+    "process",
+    "io-std",
+    "fs",
+    "signal",
+] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["std"] }
+toml = "1.0"
+
+# HTTP / networking
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "multipart",
+    "stream",
+    "blocking",
+] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "ansi", "env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Concurrency
+parking_lot = "0.12"
+async-trait = "0.1"
+futures = "0.3"
+
+# TUI (bins/webai + webai-tui)
+ratatui = "0.29"
+crossterm = "0.28"
+
+# WebSocket / JSON-RPC server (webai-acp)
+tokio-tungstenite = { version = "0.26", features = ["__rustls-tls", "native-tls"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

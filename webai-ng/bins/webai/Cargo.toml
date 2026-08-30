@@ -1,0 +1,15 @@
+[package]
+name = "webai"
+description = "webai-ng main binary: default TUI; --serve starts ACP; --headless runs without a UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "webai"
+path = "src/main.rs"
+
+[dependencies]
