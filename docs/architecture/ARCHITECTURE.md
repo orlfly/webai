@@ -77,8 +77,9 @@ flowchart TB
   subgraph TOOLS[工具层]
     BT[browser 工具<br/>script_author 两阶段脚本]
     MT[memory 工具]
-    FT[filesystem 工具]
+    FT[filesystem 工具<br/>路径沙箱]
     LBT[llm 工具]
+    NT[acp_notify 工具<br/>会话事件通知]
     TT[terminate 工具]
   end
   subgraph BRIDGE[桥接层]
@@ -99,7 +100,7 @@ flowchart TB
   SVC --> RT
   RT --> SS
   SS --> LOOP
-  LOOP --> BT & MT & FT & LBT & TT
+  LOOP --> BT & MT & FT & LBT & NT & TT
   BT --> JH
   JH --> WB
   WB --> CX
@@ -115,7 +116,7 @@ flowchart TB
 |---|---|---|
 | 前端层 | 形态一 TUI（ratatui）、形态二 ACP 客户端、形态三 `webai --serve` 服务模式（复用 webai-acp 服务端） | 用户交互与会话协议；不包含业务逻辑；三形态共享 runtime 入口 |
 | 应用层 | runtime、AgentSession 池、AgentLoop | 启动装配、会话生命周期、计划-行动-观察循环 |
-| 工具层 | browser / memory / filesystem / llm / terminate | AgentLoop 可调用的工具集；browser 工具产出两阶段脚本 |
+| 工具层 | browser / memory / filesystem / llm / acp_notify / terminate | AgentLoop 可调用的工具集；browser 工具产出两阶段脚本；acp_notify 推送会话事件 |
 | 桥接层 | jcode_host、webkit_bridge、webkit-bridge-cxx | 脚本注入、事件回收、截图 / 下载 / 快照；唯一含 C++ 的位置在 webkit-bridge-cxx |
 | 核心服务 | LLM 客户端、MemoryStore、Embedding | 被应用层与工具层共享；无上游依赖 |
 | 页面内 bundle | document-start 注入的 12 模块 | DOM 解析、可访问性树、事件、网络拦截、playwright-shim 兼容层 |
@@ -194,7 +195,17 @@ agent < {acp, tui} < bins/webai                 # 前端共享 agent 公共接�
 - 零逻辑、零 IO；所有其他 crate 依赖它以共享 wire 类型。
 
 ### 4.2 webai-config
-五文件 TOML schema（与现有 `config/` 兼容）：`config.toml`（agent 选择：llm/memory/tools/max_steps/duplicate_threshold）、`config_llm.toml`（多 provider profile）、`config_embd.toml`、`config_mem.toml`（per-profile 后端）、`config_vec.toml`。`WEBAI_CONFIG` 环境变量可覆盖路径。加载失败 = 启动失败（fail fast），但**缺少 memory 后端时优雅降级**为无记忆模式。
+五文件 TOML schema，**文件名与键名与产品文档（PRODUCT-DESIGN §7.1）逐项一致**，存放于配置目录（默认 `~/.webai/config/`，`WEBAI_CONFIG` 环境变量指向该目录）：
+
+| 文件 | 职责 | 关键键 | 缺失影响 |
+|---|---|---|---|
+| `agent.toml` | agent 行为 | `max_steps`、`duplicate_threshold`、`auto_plan_on_multi_step`、`script_memory_enabled` | fail-fast（无默认护栏时拒绝启动） |
+| `llm.toml` | LLM provider | 多 profile（`[profile.xxx]`：endpoint / model / api_key / timeout） | fail-fast，按名选 profile |
+| `embd.toml` | 向量 embedding | 模型端点、维度 | 降级：仅图通道或无记忆运行 |
+| `mem.toml` | 记忆储存 | 向量+图后端地址、数据库路径 | 降级：无记忆运行，主流程不受影响 |
+| `vec.toml` | 向量检索 | HNSW 参数（M/ef/维度）、索引路径 | 降级：同 embd |
+
+加载失败 = 启动失败（fail fast，限于 `agent.toml` / `llm.toml`）；**缺少 `embd.toml` / `mem.toml` / `vec.toml` 时优雅降级**为无记忆模式。
 
 ### 4.3 webai-llm
 - `LlmClient::from_default_location()`；profile 到端点的映射；支持 OpenAI 兼容 HTTP（dashscope 等）与 llama.cpp 本地 server。
@@ -211,7 +222,7 @@ agent < {acp, tui} < bins/webai                 # 前端共享 agent 公共接�
 - `ScriptModule { execute_src, verify_src, args }`；驱动 IIFE 返回 `{execute, verify, args}`。
 - 词表：`execute_<verb>(args)` 读 `window.__webkit_args__`。
 - Screenshot/Download/Snapshot 走单脚本 + 直通 verify（现状语义保留）。
-- Download 特例：页面脚本只发 `needs_rust_download` 信号，真实下载由 Rust 侧 reqwest 完成（文件名来自 args.filename / Content-Disposition / URL 尾段；防路径穿越；重名加 `-N` 后缀）。
+- Download 特例：页面脚本只发 `needs_rust_download` 信号，真实下载由 Rust 侧 reqwest 完成。**文件名推断优先级与产品 FR-4 一致**：`args.filename` → `Content-Disposition` → URL 尾段 → 均不可得时由 LLM 按任务上下文生成有语义文件名（回退结果同样经过路径安全校验）；防路径穿越；重名加 `-N` 后缀。
 - 全 crate 禁止 IO，测试 = 模板快照 + 参数注入 + 错误路径。
 
 ### 4.6 webai-webkit（WebkitBridge）
@@ -228,9 +239,9 @@ agent < {acp, tui} < bins/webai                 # 前端共享 agent 公共接�
 ### 4.8 webai-bridge（jcode_host 等价）
 - `dispatch(Request) -> Response`（Bridge 协议入口），内部 `handle_tool_call(BrowserToolRequest) -> BrowserToolResponse`。
 - 职责：调 `webai-script::compose` → `webkit.evaluate` → 合并 `execute`/`verify` 两阶段 payload，`ok = execute.ok && verify.ok`（verify 失败进入重生成路径）。
-- **每次成功且非 screenshot/download 的操作后自动截图**，路径附在响应上，经 `ToolOutput.images → AgentStep.image → ChatMessage.image` 管道送入 TUI 与模型；截图失败静默（不影响操作成功语义）。
+- **每次成功且非 screenshot/download 的操作后自动截图**，路径附在响应上，经 `ToolOutput.images → AgentStep.image → ChatMessage.image` 管道送入 TUI 与模型。截图失败不回滚本轮操作，但**必须产出结构化截图警告**（`error.code` + 人读原因 + 占位符标记），随 `SessionEvent::Step` 透出并在 TUI 呈现占位符+原因，禁止静默吞掉（对齐 FR-2 验收：每步要么有截图记录，要么有明确占位符+原因）。
 - `parse_probe_response` 解析 snapshot：`location.href/title/readyState/正文片段`。
-- 下载路由（见 4.5）在此实现。
+- 下载路由（见 4.5）在此实现：按 FR-4 优先级推断文件名，LLM 语义文件名回退与路径穿越防护在本层落地。
 
 ### 4.9 webai-agent
 - `AgentLoop`：plan → act → observe 循环。
@@ -240,7 +251,7 @@ agent < {acp, tui} < bins/webai                 # 前端共享 agent 公共接�
   - 守卫：`max_steps`（默认 30，超限产出结构化 `max_steps_exceeded` 事件）、`duplicate_threshold`（默认 2，相同观察即判卡死）。
   - `history_summariser`：长会话压缩。
 - `AgentSession`：转录（`Mutex<Vec<ChatMessage>>`）、`Arc<AgentLoop>`、JSONL 写入句柄（复用 webai-memory 会话日志组件，见 §4.4）、可选 `Arc<SharedMemoryStore>`。
-- 工具注册表：`Tool` trait + 五个核心工具（browser/memory/filesystem/llm/acp_notify）+ terminate。文件工具必须有路径沙箱（沿用现有 `fs_bridge` 的校验逻辑）。
+- 工具注册表：`Tool` trait + 六个工具：`browser` / `memory` / `filesystem` / `llm` / `acp_notify` / `terminate`（与 §2 工具层图一致）。文件工具必须有路径沙箱（沿用现有 `fs_bridge` 的校验逻辑）；`terminate` 供 AgentLoop 主动结束会话。
 
 ### 4.10 webai-acp
 - JSON-RPC over WebSocket / 行分隔 TCP；方法面与现有 ACP 协议兼容。
@@ -309,18 +320,25 @@ execute 或 verify 任一失败 → 收集 `{失败脚本, 错误(含 JS 异常�
 ## 8. 配置示例（沿用 schema）
 
 ```toml
-# config.toml
-[webai]
-llm = "deepseek-v4-flash"
-memory = "default"
-tools = []
+# agent.toml
 max_steps = 30
 duplicate_threshold = 2
-[webai.memory_config]
-backend = "kuzu"
-[webai.loop]
 auto_plan_on_multi_step = true
 script_memory_enabled = true
+
+# llm.toml
+[profile.cloud]
+endpoint = "https://api.dashscope.com/v1"
+model = "deepseek-v4-flash"
+timeout = 120
+
+[profile.local]
+endpoint = "http://127.0.0.1:8080"
+model = "llama3"
+
+# mem.toml
+backend = "kuzu"
+path = "~/.webai/memory/"
 ```
 
 ## 9. 测试策略（分层金字塔）
