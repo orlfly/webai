@@ -9,3 +9,15 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+webai-protocol = { path = "../webai-protocol" }
+webai-bridge = { path = "../webai-bridge" }
+webai-llm = { path = "../webai-llm" }
+webai-memory = { path = "../webai-memory" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }

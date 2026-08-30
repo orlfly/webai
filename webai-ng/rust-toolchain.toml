@@ -1,9 +1,10 @@
 # webai-ng build toolchain.
 #
-# Minimum supported Rust version per docs/ARCHITECTURE.md §10: `Rust 1.87+`,
-# edition 2021. rust-toolchain.toml pins the floor so the build fails loudly
-# if a too-old toolchain is used. Newer toolchains are used as-is.
+# Minimum supported Rust version (MSRV) is `Rust 1.87`, edition 2021
+# (docs/ARCHITECTURE.md §10), enforced via `rust-version = "1.87"` in the
+# workspace manifest. Building uses `stable` so the actual compiler on the
+# machine is used; CI may pin a specific version via `RUSTUP_TOOLCHAIN`.
 
 [toolchain]
-channel = "1.87"
+channel = "stable"
 components = ["rustfmt", "clippy"]

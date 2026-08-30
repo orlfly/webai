@@ -9,3 +9,16 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+webai-protocol = { path = "../webai-protocol" }
+webai-script = { path = "../webai-script" }
+webai-webkit = { path = "../webai-webkit" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

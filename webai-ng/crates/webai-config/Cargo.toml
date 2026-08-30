@@ -9,3 +9,9 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+webai-protocol = { path = "../webai-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
