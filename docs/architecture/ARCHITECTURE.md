@@ -11,7 +11,11 @@
 
 ### 定论一：脚本驱动浏览器控制（script-driven browser control）
 
-所有浏览器动作（navigate / click / fill / hover / drag / press-key / screenshot / accessibility tree / network 拦截 / snapshot / download）一律表达为 JavaScript，由 LLM 在运行时**编写或组合**，Rust 桥只负责把脚本注入 WebKit 并回收 JSON 结果。
+所有浏览器动作一律表达为 JavaScript，由 LLM 在运行时**编写或组合**，Rust 桥只负责把脚本注入 WebKit 并回收 JSON 结果。动词面与产品 FR-1 / §4.1 `BrowserVerb` 枚举逐项对应，共 13 个：
+
+`navigate` / `click` / `fill` / `hover` / `drag` / `press_key` / `evaluate` / `screenshot` / `accessibility_tree` / `get_text` / `get_html` / `download` / `snapshot`
+
+（完整形态以 §4.1 `BrowserVerb` 为准；network 拦截等能力是页面内 bundle 模块的构建块，不属于动词表。）
 
 **Rust 侧不实现任何浏览器命令逻辑。**
 
@@ -50,19 +54,21 @@ JS 执行只发生在 WebKit 的 JavaScriptCore 内。Rust 侧不嵌第二个 JS
 2. JSONL 追加式持久化——写后即 flush，崩溃最多损失最后一条截断记录，恢复时跳过截断行续跑（落盘路径 `~/.webai/sessions/`）；
 3. 可选的跨会话共享记忆句柄（向量 + 图双通道 MemoryStore）。
 
-- 理由：会话是产品层（TUI / ACP / HTTP 三形态）统一的抽象单位，把它做成一等对象后，三种前端形态复用同一套会话生命周期与恢复语义。
+- 理由：会话是产品层三形态（形态一 TUI / 形态二 ACP / 形态三 `--serve` 服务模式，见 PRODUCT-DESIGN §3）统一的抽象单位，把它做成一等对象后，三种前端形态复用同一套会话生命周期与恢复语义。
 - 后果：`AgentSession` 的状态机（新建 / 恢复 / 暂停 / 关闭）必须在 `webai-agent` crate 中显式建模，不允许散落在前端代码里。
 
 ## 2. 顶层架构图
 
-系统自上而下分为六层：前端层 → 应用层 → 工具层 → 桥接层 → 核心服务，以及运行在 WebKit 页面内的 bundle。依赖方向单向向下（核心服务除外，被应用层与工具层共享调用）。
+系统自上而下分为六层：前端层 → 应用层 → 工具层 → 桥接层 → 核心服务，以及运行在 WebKit 页面内的 bundle。**编译期依赖单向向下**（核心服务除外，被应用层与工具层共享调用）；图中出现的双向箭头表示运行期调用/数据流（如 AgentLoop 调用 LLM、MemoryStore 互相读写），LLM/MemoryStore 等被调方不反向依赖调用方，故不构成依赖方向上的回边。
 
 ```mermaid
 flowchart TB
   subgraph FE[前端层]
     TUI[TUI 对话界面<br/>ratatui + 终端图像]
     ACP[ACP 客户端<br/>JSON-RPC over WS / TCP]
+    SVC[HTTP/脚本接入 形态三<br/>webai --serve 服务模式<br/>JSON-RPC over WS / TCP]
   end
+  ACP --> SVC
   subgraph APP[应用层]
     RT[webai-runtime<br/>启动 / 装配 / 生命周期]
     SS[AgentSession 池<br/>转录 + JSONL + 记忆句柄]
@@ -90,6 +96,7 @@ flowchart TB
   end
   TUI --> RT
   ACP --> RT
+  SVC --> RT
   RT --> SS
   SS --> LOOP
   LOOP --> BT & MT & FT & LBT & TT
@@ -106,7 +113,7 @@ flowchart TB
 
 | 层 | 组成 | 职责边界 |
 |---|---|---|
-| 前端层 | TUI（ratatui）、ACP 服务端 | 用户交互与会话协议；不包含业务逻辑 |
+| 前端层 | 形态一 TUI（ratatui）、形态二 ACP 客户端、形态三 `webai --serve` 服务模式（复用 webai-acp 服务端） | 用户交互与会话协议；不包含业务逻辑；三形态共享 runtime 入口 |
 | 应用层 | runtime、AgentSession 池、AgentLoop | 启动装配、会话生命周期、计划-行动-观察循环 |
 | 工具层 | browser / memory / filesystem / llm / terminate | AgentLoop 可调用的工具集；browser 工具产出两阶段脚本 |
 | 桥接层 | jcode_host、webkit_bridge、webkit-bridge-cxx | 脚本注入、事件回收、截图 / 下载 / 快照；唯一含 C++ 的位置在 webkit-bridge-cxx |
@@ -152,8 +159,10 @@ webai-ng/
 
 ```
 protocol < config < {llm, memory, embedding, script}
-script + webkit < bridge < agent < {acp, tui} < bins/webai
+{script, webkit} < bridge < agent < {acp, tui} < bins/webai
 ```
+
+（`{a, b}` 表示并列、无相互依赖；`script` 与 `webkit` 之间无依赖边，二者都只被 `bridge` 组合，见下表。）
 
 含义与检查手段：
 
