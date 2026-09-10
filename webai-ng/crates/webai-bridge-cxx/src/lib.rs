@@ -126,6 +126,30 @@ impl WebkitBridgeCxx {
         }
     }
 
+    /// Inject a document-start user script.
+    pub fn inject_user_script(&self, script: &str) -> Result<(), BridgeCxxError> {
+        #[cfg(not(feature = "legacy_cpp"))]
+        {
+            let _ = script;
+            Err(BridgeCxxError::CogLaunch(
+                "inject_user_script requires the legacy_cpp feature".into(),
+            ))
+        }
+        #[cfg(feature = "legacy_cpp")]
+        {
+            let view = self
+                .view
+                .ok_or_else(|| BridgeCxxError::CogLaunch("view not launched".into()))?;
+            let rc = unsafe { ffi::webkit_bridge_inject_user_script(view, script) };
+            if rc != 0 {
+                return Err(BridgeCxxError::Ffi(format!(
+                    "webkit_bridge_inject_user_script returned {rc}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
     /// Evaluate a JavaScript snippet, returning the JSON payload.
     pub fn evaluate(&self, js: &str, timeout_ms: u32) -> Result<String, BridgeCxxError> {
         #[cfg(not(feature = "legacy_cpp"))]
