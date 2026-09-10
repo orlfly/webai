@@ -18,6 +18,8 @@ use webai_protocol::{
 use webai_script::{compose, ScriptError};
 use webai_webkit::{EvaluateResult, WebkitBridge, WebkitError};
 
+pub mod download;
+
 /// Structured error from the bridge layer.
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -94,17 +96,58 @@ impl Bridge {
     /// Handle a browser-tool request end to end.
     ///
     /// Composes the two-phase script, evaluates it in WebKit, and merges the
-    /// execute/verify payloads.
+    /// execute/verify payloads. Download is a Rust-side operation (the page
+    /// script only emits `needs_rust_download`), so it is routed to
+    /// [`Self::handle_download`].
     pub async fn handle_tool_call(
         &self,
         req: &BrowserToolRequest,
     ) -> Result<BrowserToolResponse, BridgeError> {
+        if req.verb == webai_protocol::BrowserVerb::Download {
+            return self.handle_download(&req.args).await;
+        }
         let module = compose(req)?;
         let result = self
             .webkit
             .evaluate_javascript(&module.execute_src, 30_000)
             .await?;
         self.merge(req, result).await
+    }
+
+    /// Handle a download request: fetch the URL in Rust and persist the body.
+    pub async fn handle_download(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<BrowserToolResponse, BridgeError> {
+        let directory = args
+            .get("directory")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        match download::download(args, directory.as_deref()).await {
+            Ok(result) => Ok(BrowserToolResponse {
+                ok: true,
+                result: Some(serde_json::json!({
+                    "ok": true,
+                    "url": result.url,
+                    "filename": result.filename,
+                    "saved_to": result.saved_to,
+                    "directory": result.directory,
+                    "bytes": result.bytes,
+                })),
+                error: None,
+                image_path: None,
+            }),
+            Err(e) => Ok(BrowserToolResponse {
+                ok: false,
+                result: None,
+                error: Some(BrowserToolError {
+                    code: codes::INTERNAL_ERROR,
+                    message: e.to_string(),
+                    detail: Some(e.code().to_owned()),
+                }),
+                image_path: None,
+            }),
+        }
     }
 
     /// Merge the execute/verify phase result into a response.
