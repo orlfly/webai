@@ -144,6 +144,7 @@ impl Bridge {
                 error: Some(BrowserToolError {
                     code: codes::INTERNAL_ERROR,
                     message: e.to_string(),
+                    phase: None,
                     detail: Some(e.code().to_owned()),
                 }),
                 image_path: None,
@@ -185,9 +186,15 @@ impl Bridge {
                 .unwrap_or_else(|| {
                     format!("{phase} phase failed with no error detail: {phase_json}")
                 });
+            let code = if phase == "execute" {
+                codes::EXECUTE_FAILED
+            } else {
+                codes::VERIFY_FAILED
+            };
             Some(BrowserToolError {
-                code: codes::INTERNAL_ERROR,
+                code,
                 message: format!("{phase} phase failed"),
+                phase: Some(phase.to_owned()),
                 detail: Some(detail),
             })
         } else {
@@ -220,6 +227,7 @@ impl Bridge {
                         response.screenshot_warning = Some(BrowserToolError {
                             code: codes::INTERNAL_ERROR,
                             message: "auto-screenshot failed to persist".into(),
+                            phase: None,
                             detail: Some("could not write screenshot PNG to temp dir".into()),
                         });
                     }
@@ -228,6 +236,7 @@ impl Bridge {
                     response.screenshot_warning = Some(BrowserToolError {
                         code: codes::INTERNAL_ERROR,
                         message: "auto-screenshot returned empty image".into(),
+                        phase: None,
                         detail: Some("screenshot produced no bytes".into()),
                     });
                 }
@@ -237,6 +246,7 @@ impl Bridge {
                     response.screenshot_warning = Some(BrowserToolError {
                         code: codes::INTERNAL_ERROR,
                         message: "auto-screenshot failed".into(),
+                        phase: None,
                         detail: Some(e.to_string()),
                     });
                 }

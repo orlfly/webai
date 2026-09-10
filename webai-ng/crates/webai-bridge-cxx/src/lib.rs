@@ -85,6 +85,7 @@ impl WebkitBridgeCxx {
             result: Some(serde_json::json!({ "stub": true })),
             error: None,
             image_path: None,
+            screenshot_warning: None,
         })
     }
 }
