@@ -48,30 +48,78 @@ pub fn bundle_script(path: &str) -> Option<&'static str> {
         return None;
     }
     Some(match path {
-        "bridge-client.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/bridge-client.js")),
-        "parser/index.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/parser/index.js")),
-        "accessibility/index.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/accessibility/index.js")),
-        "dom.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/dom.js")),
-        "selector.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/selector.js")),
-        "events.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/events.js")),
-        "network.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/network.js")),
-        "storage.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/storage.js")),
-        "actions/navigate.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/actions/navigate.js")),
-        "actions/history.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/actions/history.js")),
-        "actions/interact.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/actions/interact.js")),
-        "actions/extract.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/actions/extract.js")),
-        "actions/screenshot.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/actions/screenshot.js")),
-        "actions/composite.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/actions/composite.js")),
-        "legacy/playwright-shim.js" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../page-bundle/legacy/playwright-shim.js")),
+        "bridge-client.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/bridge-client.js"
+        )),
+        "parser/index.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/parser/index.js"
+        )),
+        "accessibility/index.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/accessibility/index.js"
+        )),
+        "dom.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/dom.js"
+        )),
+        "selector.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/selector.js"
+        )),
+        "events.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/events.js"
+        )),
+        "network.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/network.js"
+        )),
+        "storage.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/storage.js"
+        )),
+        "actions/navigate.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/actions/navigate.js"
+        )),
+        "actions/history.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/actions/history.js"
+        )),
+        "actions/interact.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/actions/interact.js"
+        )),
+        "actions/extract.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/actions/extract.js"
+        )),
+        "actions/screenshot.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/actions/screenshot.js"
+        )),
+        "actions/composite.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/actions/composite.js"
+        )),
+        "legacy/playwright-shim.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/legacy/playwright-shim.js"
+        )),
         _ => unreachable!("BUNDLE_SCRIPT_ORDER membership already checked"),
     })
 }
 
 /// Iterate the full bundle in `BUNDLE_SCRIPT_ORDER`, yielding `(path, source)`.
 pub fn bundle_scripts() -> impl Iterator<Item = (&'static str, &'static str)> {
-    BUNDLE_SCRIPT_ORDER
-        .iter()
-        .map(|path| (*path, bundle_script(path).expect("bundle entry must have embedded source")))
+    BUNDLE_SCRIPT_ORDER.iter().map(|path| {
+        (
+            *path,
+            bundle_script(path).expect("bundle entry must have embedded source"),
+        )
+    })
 }
 
 /// WebKit bridge errors (ARCHITECTURE.md §7).
@@ -150,12 +198,21 @@ impl WebkitBridge {
         let mut backend = WebkitBridgeCxx::default();
         let launched = backend.launch().is_ok();
         let backend = if launched { Some(backend) } else { None };
-        Self {
+        let bridge = Self {
             backend: Arc::new(Mutex::new(backend)),
             last_load_uri: Arc::new(Mutex::new(None)),
             load_waiters: Arc::new(Mutex::new(Vec::new())),
             canned: Arc::new(Mutex::new(None)),
+        };
+        // Wire the LOAD_FINISHED trampoline: the cxx bridge calls this closure
+        // on the loop thread when WEBKIT_LOAD_FINISHED fires.
+        if let Some(b) = bridge.backend.lock().unwrap().as_mut() {
+            let bridge_for_cb = bridge.clone();
+            b.set_load_callback(move |event: LoadFinished| {
+                bridge_for_cb.on_load_finished(event);
+            });
         }
+        bridge
     }
 
     /// Construct a bridge with a canned backend for tests (no FFI needed).
@@ -182,14 +239,16 @@ impl WebkitBridge {
                 return Ok(ev.clone());
             }
         }
-        let backend = self.backend.lock().unwrap();
-        let backend = backend.as_ref().ok_or_else(|| {
-            WebkitError::CogLaunch(format!(
-                "no FFI environment (open {url}); configure webai-bridge-cxx and run with the cog bridge"
-            ))
-        })?;
-        backend.load_uri(url)?;
-        // Wait for the load to finish (oneshot).
+        {
+            let backend = self.backend.lock().unwrap();
+            let backend = backend.as_ref().ok_or_else(|| {
+                WebkitError::CogLaunch(format!(
+                    "no FFI environment (open {url}); configure webai-bridge-cxx and run with the cog bridge"
+                ))
+            })?;
+            backend.load_uri(url)?;
+        } // drop the lock before awaiting
+          // Wait for the load to finish (oneshot).
         self.wait_for_load(15_000).await
     }
 
@@ -227,7 +286,10 @@ impl WebkitBridge {
                 .to_owned();
             return Err(WebkitError::ScriptError(msg));
         }
-        let json = parsed.get("value").cloned().unwrap_or(serde_json::Value::Null);
+        let json = parsed
+            .get("value")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         Ok(EvaluateResult {
             json,
             screenshot_path: None,
@@ -277,15 +339,13 @@ impl WebkitBridge {
         }
         let backend = self.backend.lock().unwrap();
         let backend = backend.as_ref().ok_or_else(|| {
-            WebkitError::CogLaunch(
-                "no FFI environment; cannot screenshot in stub mode".into(),
-            )
+            WebkitError::CogLaunch("no FFI environment; cannot screenshot in stub mode".into())
         })?;
         // The bridge-cxx screenshot writes to a temp file; read it back.
         let path = std::env::temp_dir().join(format!("webai-shot-{}.png", std::process::id()));
-        let path_str = path.to_str().ok_or_else(|| {
-            WebkitError::ScriptError("temp path not UTF-8".into())
-        })?;
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| WebkitError::ScriptError("temp path not UTF-8".into()))?;
         backend.screenshot(path_str)?;
         let bytes = std::fs::read(&path)
             .map_err(|e| WebkitError::ScriptError(format!("read screenshot: {e}")))?;
@@ -348,7 +408,10 @@ mod tests {
             "legacy/playwright-shim.js",
         ];
         assert_eq!(BUNDLE_SCRIPT_ORDER.len(), 15, "must be exactly 15 entries");
-        assert_eq!(BUNDLE_SCRIPT_ORDER, &expected, "order must match ARCHITECTURE.md §4.6");
+        assert_eq!(
+            BUNDLE_SCRIPT_ORDER, &expected,
+            "order must match ARCHITECTURE.md §4.6"
+        );
     }
 
     #[test]
@@ -366,7 +429,10 @@ mod tests {
     #[test]
     fn bridge_client_installs_webkit_bridge_global() {
         let src = bundle_script("bridge-client.js").expect("bridge-client embedded");
-        assert!(src.contains("window.__webkitBridge"), "must install __webkitBridge");
+        assert!(
+            src.contains("window.__webkitBridge"),
+            "must install __webkitBridge"
+        );
         assert!(src.contains("__webkitBridgeLoaded"), "must signal loaded");
     }
 
@@ -374,7 +440,10 @@ mod tests {
     fn playwright_shim_declares_its_dependencies() {
         let src = bundle_script("legacy/playwright-shim.js").expect("shim embedded");
         assert!(src.contains("WebkitAiDom"), "shim depends on WebkitAiDom");
-        assert!(src.contains("DEPENDENCIES"), "shim must declare dependencies");
+        assert!(
+            src.contains("DEPENDENCIES"),
+            "shim must declare dependencies"
+        );
     }
 
     #[tokio::test]
@@ -395,7 +464,10 @@ mod tests {
             bridge.evaluate_javascript("1+1", 100).await,
             Err(WebkitError::CogLaunch(_))
         ));
-        assert!(matches!(bridge.screenshot().await, Err(WebkitError::CogLaunch(_))));
+        assert!(matches!(
+            bridge.screenshot().await,
+            Err(WebkitError::CogLaunch(_))
+        ));
         assert!(matches!(
             bridge.inject_user_script("x").await,
             Err(WebkitError::CogLaunch(_))
@@ -420,7 +492,10 @@ mod tests {
             ..Default::default()
         });
         let bytes = bridge.screenshot().await.unwrap();
-        assert_eq!(&bytes[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        assert_eq!(
+            &bytes[..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        );
     }
 
     #[tokio::test]
@@ -444,9 +519,7 @@ mod tests {
             canned: Arc::new(Mutex::new(None)),
         };
         let bridge2 = bridge.clone();
-        let handle = tokio::spawn(async move {
-            bridge2.wait_for_load(1000).await.unwrap()
-        });
+        let handle = tokio::spawn(async move { bridge2.wait_for_load(1000).await.unwrap() });
         // Give the waiter a moment to register.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         bridge.on_load_finished(LoadFinished {
@@ -456,6 +529,9 @@ mod tests {
         });
         let snapshot = handle.await.unwrap();
         assert_eq!(snapshot.url, "https://example.com");
-        assert_eq!(*bridge.last_load_uri.lock().unwrap().as_deref().unwrap(), "https://example.com");
+        assert_eq!(
+            bridge.last_load_uri.lock().unwrap().as_deref().unwrap(),
+            "https://example.com"
+        );
     }
 }

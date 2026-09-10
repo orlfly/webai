@@ -2318,6 +2318,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "webai-bridge-cxx",
  "webai-protocol",
 ]
 

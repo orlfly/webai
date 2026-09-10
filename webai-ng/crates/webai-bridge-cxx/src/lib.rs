@@ -50,6 +50,15 @@ pub struct WebkitBridgeCxx {
     view: Option<*mut ffi::WebkitView>,
 }
 
+// SAFETY: the raw `*mut WebkitView` is only ever accessed through the cxx
+// bridge, which serializes all view access on the dedicated loop thread
+// (ARCHITECTURE.md §6). The facade methods take `&self` and the underlying
+// C++ bridge owns the view lifetime, so it is safe to share across threads.
+#[cfg(feature = "legacy_cpp")]
+unsafe impl Send for WebkitBridgeCxx {}
+#[cfg(feature = "legacy_cpp")]
+unsafe impl Sync for WebkitBridgeCxx {}
+
 impl WebkitBridgeCxx {
     /// Launch/attach the real cog view. Only succeeds when compiled with the
     /// `legacy_cpp` feature and run in an FFI-capable environment.
