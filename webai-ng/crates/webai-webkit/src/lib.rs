@@ -67,6 +67,16 @@ pub struct WebkitBridge {
     #[allow(dead_code)] // consumed by the FFI backend (M2)
     view: Arc<Mutex<Option<u64>>>,
     stub_mode: bool,
+    /// Canned-response injection for tests (no FFI needed).
+    canned: Arc<Mutex<Option<CannedBackend>>>,
+}
+
+/// A canned backend for tests: returns scripted responses without WebKit.
+#[derive(Debug, Clone, Default)]
+pub struct CannedBackend {
+    pub evaluate_result: Option<serde_json::Value>,
+    pub screenshot_png: Option<Vec<u8>>,
+    pub load_events: Vec<LoadSnapshot>,
 }
 
 impl WebkitBridge {
@@ -76,6 +86,16 @@ impl WebkitBridge {
         Self {
             view: Arc::new(Mutex::new(None)),
             stub_mode: true,
+            canned: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Construct a bridge with a canned backend for tests (no FFI needed).
+    pub fn with_canned(canned: CannedBackend) -> Self {
+        Self {
+            view: Arc::new(Mutex::new(None)),
+            stub_mode: true,
+            canned: Arc::new(Mutex::new(Some(canned))),
         }
     }
 
@@ -99,6 +119,15 @@ impl WebkitBridge {
         src: &str,
         timeout_ms: u64,
     ) -> Result<EvaluateResult, WebkitError> {
+        // Canned path (tests): return the scripted result without WebKit.
+        if let Some(canned) = self.canned.lock().unwrap().as_ref() {
+            if let Some(json) = canned.evaluate_result.clone() {
+                return Ok(EvaluateResult {
+                    json,
+                    screenshot_path: None,
+                });
+            }
+        }
         let _ = (src, timeout_ms);
         if self.stub_mode {
             return Err(WebkitError::CogLaunch(
@@ -113,6 +142,10 @@ impl WebkitBridge {
 
     /// Register a document-start user script.
     pub async fn inject_user_script(&self, src: &str) -> Result<(), WebkitError> {
+        // Canned path (tests): no-op success.
+        if self.canned.lock().unwrap().is_some() {
+            return Ok(());
+        }
         let _ = src;
         if self.stub_mode {
             return Err(WebkitError::CogLaunch(
@@ -124,6 +157,12 @@ impl WebkitBridge {
 
     /// Capture a viewport PNG.
     pub async fn screenshot(&self) -> Result<Vec<u8>, WebkitError> {
+        // Canned path (tests): return the scripted PNG.
+        if let Some(canned) = self.canned.lock().unwrap().as_ref() {
+            if let Some(png) = canned.screenshot_png.clone() {
+                return Ok(png);
+            }
+        }
         if self.stub_mode {
             return Err(WebkitError::CogLaunch(
                 "no FFI environment; cannot screenshot in stub mode".into(),
@@ -172,7 +211,10 @@ mod tests {
             bridge.evaluate_javascript("1+1", 100).await,
             Err(WebkitError::CogLaunch(_))
         ));
-        assert!(matches!(bridge.screenshot().await, Err(WebkitError::CogLaunch(_))));
+        assert!(matches!(
+            bridge.screenshot().await,
+            Err(WebkitError::CogLaunch(_))
+        ));
         assert!(matches!(
             bridge.inject_user_script("x").await,
             Err(WebkitError::CogLaunch(_))
