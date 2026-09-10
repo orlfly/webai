@@ -281,11 +281,15 @@ impl WebkitBridge {
         let parsed: serde_json::Value = serde_json::from_str(&payload)
             .map_err(|e| WebkitError::ScriptError(format!("invalid evaluate payload: {e}")))?;
         if parsed.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            // Surface the JS exception text verbatim (定论二); never fall back
+            // to a generic "unknown error".
             let msg = parsed
                 .get("error")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown error")
-                .to_owned();
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!("script failed with no error detail: {parsed}")
+                });
             return Err(WebkitError::ScriptError(msg));
         }
         let json = parsed
