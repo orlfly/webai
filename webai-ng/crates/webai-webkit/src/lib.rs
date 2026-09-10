@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use webai_bridge_cxx::{BridgeCxxError, LoadFinished, WebkitBridgeCxx};
 
+pub mod pool;
+
 /// Ordered list of page-side bundle scripts (ARCHITECTURE.md §4.6). Order is
 /// significant and must be preserved exactly.
 pub const BUNDLE_SCRIPT_ORDER: &[&str] = &[
@@ -183,10 +185,10 @@ pub struct WebkitBridge {
 
 /// A canned backend for tests: returns scripted responses without WebKit.
 #[derive(Debug, Clone, Default)]
-struct CannedBackend {
-    evaluate_result: Option<serde_json::Value>,
-    screenshot_png: Option<Vec<u8>>,
-    load_events: Vec<LoadSnapshot>,
+pub(crate) struct CannedBackend {
+    pub(crate) evaluate_result: Option<serde_json::Value>,
+    pub(crate) screenshot_png: Option<Vec<u8>>,
+    pub(crate) load_events: Vec<LoadSnapshot>,
 }
 
 impl WebkitBridge {
@@ -217,7 +219,7 @@ impl WebkitBridge {
 
     /// Construct a bridge with a canned backend for tests (no FFI needed).
     #[cfg(test)]
-    fn with_canned(canned: CannedBackend) -> Self {
+    pub(crate) fn with_canned(canned: CannedBackend) -> Self {
         Self {
             backend: Arc::new(Mutex::new(None)),
             last_load_uri: Arc::new(Mutex::new(None)),
