@@ -136,6 +136,7 @@ impl Bridge {
                 })),
                 error: None,
                 image_path: None,
+                screenshot_warning: None,
             }),
             Err(e) => Ok(BrowserToolResponse {
                 ok: false,
@@ -146,6 +147,7 @@ impl Bridge {
                     detail: Some(e.code().to_owned()),
                 }),
                 image_path: None,
+                screenshot_warning: None,
             }),
         }
     }
@@ -197,14 +199,46 @@ impl Bridge {
             result: Some(json.clone()),
             error,
             image_path: None,
+            screenshot_warning: None,
         };
 
+        // Auto-screenshot after every successful non-screenshot/download
+        // operation (FR-2 / ARCHITECTURE.md §4.8). A screenshot failure does
+        // NOT roll back the operation, but must be surfaced structurally.
         if ok && wants_screenshot(&req.verb) {
-            // Screenshot capture is silent on failure (does not change the
-            // operation's success semantics, ARCHITECTURE.md §4.8).
-            if let Ok(png) = self.webkit.screenshot().await {
-                if !png.is_empty() {
-                    response.image_path = Some("/tmp/webai-stub.png".into());
+            match self.webkit.screenshot().await {
+                Ok(png) if !png.is_empty() => {
+                    // Persist the PNG to a temp file and attach its path.
+                    let path = std::env::temp_dir()
+                        .join("webai-screenshots")
+                        .join(format!("shot-{}.png", std::process::id()));
+                    if std::fs::create_dir_all(path.parent().unwrap()).is_ok()
+                        && std::fs::write(&path, &png).is_ok()
+                    {
+                        response.image_path = Some(path.to_string_lossy().to_string());
+                    } else {
+                        response.screenshot_warning = Some(BrowserToolError {
+                            code: codes::INTERNAL_ERROR,
+                            message: "auto-screenshot failed to persist".into(),
+                            detail: Some("could not write screenshot PNG to temp dir".into()),
+                        });
+                    }
+                }
+                Ok(_) => {
+                    response.screenshot_warning = Some(BrowserToolError {
+                        code: codes::INTERNAL_ERROR,
+                        message: "auto-screenshot returned empty image".into(),
+                        detail: Some("screenshot produced no bytes".into()),
+                    });
+                }
+                Err(e) => {
+                    // Operation result is preserved; only the screenshot is
+                    // best-effort (FR-2). Surface a structured warning.
+                    response.screenshot_warning = Some(BrowserToolError {
+                        code: codes::INTERNAL_ERROR,
+                        message: "auto-screenshot failed".into(),
+                        detail: Some(e.to_string()),
+                    });
                 }
             }
         }
@@ -331,5 +365,85 @@ mod tests {
         assert!(!wants_screenshot(&Screenshot));
         assert!(!wants_screenshot(&Snapshot));
         assert!(!wants_screenshot(&GetText));
+    }
+
+    /// A canned bridge that returns a scripted two-phase payload AND a PNG
+    /// screenshot, so the auto-screenshot path attaches an image.
+    fn canned_bridge_with_png() -> WebkitBridge {
+        WebkitBridge::with_canned(webai_webkit::CannedBackend {
+            evaluate_result: Some(json!({
+                "execute": { "ok": true, "stage": "execute" },
+                "verify": { "ok": true, "stage": "verify" },
+                "args": {}
+            })),
+            screenshot_png: Some(vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn successful_operation_attaches_screenshot_path() {
+        let bridge = Bridge::new(canned_bridge_with_png());
+        let resp = bridge
+            .handle_tool_call(&req(BrowserVerb::Click, json!({ "selector": "#btn" })))
+            .await
+            .unwrap();
+        assert!(resp.ok);
+        assert!(
+            resp.image_path.is_some(),
+            "auto-screenshot path must be attached"
+        );
+        assert!(resp.screenshot_warning.is_none(), "no warning on success");
+    }
+
+    #[tokio::test]
+    async fn screenshot_failure_produces_warning_but_preserves_operation() {
+        // A canned bridge with no screenshot_png -> screenshot() returns
+        // CogLaunch (no FFI), so the auto-screenshot fails.
+        let bridge = Bridge::new(canned_bridge(true, true));
+        let resp = bridge
+            .handle_tool_call(&req(BrowserVerb::Click, json!({ "selector": "#btn" })))
+            .await
+            .unwrap();
+        // Operation result preserved.
+        assert!(resp.ok);
+        assert!(resp.error.is_none());
+        // Screenshot failure surfaced structurally.
+        let warn = resp.screenshot_warning.expect("screenshot warning present");
+        assert!(warn.message.contains("auto-screenshot"));
+        assert!(warn.detail.is_some(), "must carry a reason");
+    }
+
+    #[tokio::test]
+    async fn screenshot_verb_does_not_trigger_nested_screenshot() {
+        // Screenshot verb: the operation itself is the screenshot, so no
+        // nested auto-screenshot should run.
+        let bridge = Bridge::new(canned_bridge_with_png());
+        let resp = bridge
+            .handle_tool_call(&req(BrowserVerb::Screenshot, json!({})))
+            .await
+            .unwrap();
+        assert!(resp.ok);
+        assert!(
+            resp.image_path.is_none(),
+            "no nested screenshot for screenshot verb"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_verb_does_not_trigger_nested_screenshot() {
+        // Download is Rust-side; no auto-screenshot.
+        let bridge = Bridge::new(WebkitBridge::new());
+        let resp = bridge
+            .handle_tool_call(&req(
+                BrowserVerb::Download,
+                json!({ "url": "https://x.com/f" }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            resp.image_path.is_none(),
+            "no nested screenshot for download verb"
+        );
     }
 }

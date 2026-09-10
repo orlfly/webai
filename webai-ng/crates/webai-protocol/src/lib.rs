@@ -199,6 +199,10 @@ pub struct BrowserToolResponse {
     /// Path to the auto-captured screenshot, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_path: Option<String>,
+    /// Structured warning when the auto-screenshot failed (the operation
+    /// itself succeeded; the screenshot is best-effort, FR-2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_warning: Option<BrowserToolError>,
 }
 
 /// Structured error raised by a browser-tool invocation.
@@ -310,7 +314,11 @@ mod tests {
             (BrowserVerb::PressKey, "press_key", "press_key"),
             (BrowserVerb::Evaluate, "evaluate", "evaluate"),
             (BrowserVerb::Screenshot, "screenshot", "screenshot"),
-            (BrowserVerb::AccessibilityTree, "accessibility_tree", "accessibility_tree"),
+            (
+                BrowserVerb::AccessibilityTree,
+                "accessibility_tree",
+                "accessibility_tree",
+            ),
             (BrowserVerb::GetText, "get_text", "extract_text"),
             (BrowserVerb::GetHtml, "get_html", "extract_html"),
             (BrowserVerb::Download, "download", "download"),
@@ -393,7 +401,10 @@ mod tests {
         let json = serde_json::to_string(&envelope).unwrap();
         let value: Json = serde_json::from_str(&json).unwrap();
         assert!(value.get("id").is_none());
-        assert_eq!(value.get("method").and_then(|m| m.as_str()), Some("page.load"));
+        assert_eq!(
+            value.get("method").and_then(|m| m.as_str()),
+            Some("page.load")
+        );
     }
 
     #[test]
@@ -427,13 +438,19 @@ mod tests {
             },
         };
         let done_json = serde_json::to_string(&done).unwrap();
-        assert!(matches!(serde_json::from_str::<SessionEvent>(&done_json).unwrap(), SessionEvent::Done { .. }));
+        assert!(matches!(
+            serde_json::from_str::<SessionEvent>(&done_json).unwrap(),
+            SessionEvent::Done { .. }
+        ));
 
         let err = SessionEvent::Error {
             message: "boom".into(),
         };
         let err_json = serde_json::to_string(&err).unwrap();
-        assert!(matches!(serde_json::from_str::<SessionEvent>(&err_json).unwrap(), SessionEvent::Error { .. }));
+        assert!(matches!(
+            serde_json::from_str::<SessionEvent>(&err_json).unwrap(),
+            SessionEvent::Error { .. }
+        ));
     }
 
     #[test]
@@ -443,6 +460,7 @@ mod tests {
             result: Some(serde_json::json!({ "text": "hi" })),
             error: None,
             image_path: None,
+            screenshot_warning: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("image_path"));
