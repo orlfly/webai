@@ -10,7 +10,7 @@ pub mod session_log;
 pub use dual_channel::{
     MemoryConfig, MemoryError, MemoryWriteKind, ScriptMemoryEntry, SharedMemoryStore,
 };
-pub use session_log::{JsonlSessionLog, SessionLogError, recovery_from_persisted_step};
+pub use session_log::{recovery_from_persisted_step, JsonlSessionLog, SessionLogError};
 
 /// Shared in-memory session log (legacy recorder kept for compatibility).
 ///
@@ -22,7 +22,10 @@ pub struct JsonlSessionRecorder {
 }
 
 impl JsonlSessionRecorder {
-    pub fn new_for_dir(collab_dir: &std::path::Path, session_id: &str) -> Result<Self, MemoryError> {
+    pub fn new_for_dir(
+        collab_dir: &std::path::Path,
+        session_id: &str,
+    ) -> Result<Self, MemoryError> {
         std::fs::create_dir_all(collab_dir)
             .map_err(|e| MemoryError::BackendUnavailable(e.to_string()))?;
         Ok(Self {

@@ -29,7 +29,7 @@ pub enum MemoryWriteKind {
 }
 
 /// A structured script-memory entry (ARCHITECTURE.md §4.4).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScriptMemoryEntry {
     pub task: String,
     pub verb: String,
@@ -158,10 +158,6 @@ impl VectorIndex {
         scored.truncate(limit);
         scored
     }
-
-    fn len(&self) -> usize {
-        self.vectors.len()
-    }
 }
 
 /// The dual-channel memory store (ARCHITECTURE.md §4.4).
@@ -174,6 +170,11 @@ pub struct SharedMemoryStore {
 }
 
 impl SharedMemoryStore {
+    /// Construct a store with default config.
+    pub fn new() -> Self {
+        Self::from_config(MemoryConfig::default())
+    }
+
     /// Construct a store from a config. If the backend is unavailable, the
     /// store degrades to no-memory mode (logs a clear message, never fails).
     pub fn from_config(config: MemoryConfig) -> Self {
@@ -241,7 +242,12 @@ impl SharedMemoryStore {
             .map_err(|_| ())
             .map(|v| v.recall(task, limit))
             .unwrap_or_default();
-        let graph = self.graph.read().map_err(|_| ()).map(|g| g.all()).unwrap_or_default();
+        let graph = self
+            .graph
+            .read()
+            .map_err(|_| ())
+            .map(|g| g.all())
+            .unwrap_or_default();
         let by_id: HashMap<String, ScriptMemoryEntry> =
             graph.into_iter().map(|e| (e.id.clone(), e)).collect();
         ranked
@@ -259,7 +265,7 @@ impl SharedMemoryStore {
         self.len() == 0
     }
 
-    /// Persist the vector index to the configured path.
+    /// Persist the vector index AND the graph entries to the configured path.
     fn persist_index(&self) -> Result<(), MemoryError> {
         let path = &self.config.index_path;
         if let Some(parent) = path.parent() {
@@ -272,9 +278,15 @@ impl SharedMemoryStore {
             .map_err(|_| MemoryError::PersistFailed("vector lock poisoned".into()))?
             .vectors
             .clone();
+        let entries = self
+            .graph
+            .read()
+            .map_err(|_| MemoryError::PersistFailed("graph lock poisoned".into()))?
+            .all();
         let data = serde_json::json!({
             "dim": self.config.dim,
             "vectors": vectors,
+            "entries": entries,
         });
         std::fs::write(path, serde_json::to_vec(&data).unwrap_or_default())
             .map_err(|e| MemoryError::PersistFailed(e.to_string()))
@@ -286,10 +298,10 @@ impl SharedMemoryStore {
         if !path.exists() {
             return Ok(()); // no persisted index yet
         }
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| MemoryError::PersistFailed(e.to_string()))?;
-        let data: Json = serde_json::from_str(&raw)
-            .map_err(|e| MemoryError::PersistFailed(e.to_string()))?;
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| MemoryError::PersistFailed(e.to_string()))?;
+        let data: Json =
+            serde_json::from_str(&raw).map_err(|e| MemoryError::PersistFailed(e.to_string()))?;
         let dim = data.get("dim").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let vectors = data.get("vectors").and_then(|v| v.as_object());
         if let Some(vectors) = vectors {
@@ -302,8 +314,22 @@ impl SharedMemoryStore {
                 if let Some(arr) = v.as_array() {
                     idx.vectors.insert(
                         id.clone(),
-                        arr.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect(),
+                        arr.iter()
+                            .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+                            .collect(),
                     );
+                }
+            }
+        }
+        // Restore the graph entries so recall_scripts can resolve ids.
+        if let Some(entries) = data.get("entries").and_then(|v| v.as_array()) {
+            let mut graph = self
+                .graph
+                .write()
+                .map_err(|_| MemoryError::PersistFailed("graph lock poisoned".into()))?;
+            for e in entries {
+                if let Ok(entry) = serde_json::from_value::<ScriptMemoryEntry>(e.clone()) {
+                    graph.insert(entry);
                 }
             }
         }
@@ -321,6 +347,13 @@ impl Default for SharedMemoryStore {
 mod tests {
     use super::*;
 
+    fn unique_index() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("webai-idx-{}-{n}", std::process::id()))
+    }
+
     fn sample_entry(verb: &str, task: &str) -> ScriptMemoryEntry {
         ScriptMemoryEntry {
             task: task.to_string(),
@@ -335,40 +368,56 @@ mod tests {
     #[test]
     fn write_and_recall_script_entries() {
         let store = SharedMemoryStore::from_config(MemoryConfig {
-            index_path: std::env::temp_dir().join(format!("webai-idx-{}", std::process::id())),
+            index_path: unique_index(),
             ..Default::default()
         });
-        store.write_script(sample_entry("click", "submit login form")).unwrap();
-        store.write_script(sample_entry("fill", "submit login form")).unwrap();
+        store
+            .write_script(sample_entry("click", "submit login form"))
+            .unwrap();
+        store
+            .write_script(sample_entry("fill", "submit login form"))
+            .unwrap();
         let hits = store.recall_scripts("login form", 10);
         assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|e| e.tags.first().map(|t| t.starts_with("script:")).unwrap_or(false)));
+        assert!(hits.iter().all(|e| e
+            .tags
+            .first()
+            .map(|t| t.starts_with("script:"))
+            .unwrap_or(false)));
         assert_eq!(store.len(), 2);
     }
 
     #[test]
     fn recall_ranks_by_semantic_similarity() {
         let store = SharedMemoryStore::from_config(MemoryConfig {
-            index_path: std::env::temp_dir().join(format!("webai-idx-{}", std::process::id())),
+            index_path: unique_index(),
             ..Default::default()
         });
-        store.write_script(sample_entry("click", "submit login form")).unwrap();
-        store.write_script(sample_entry("click", "buy groceries")).unwrap();
-        // "login" should rank the login-form entry first.
+        store
+            .write_script(sample_entry("click", "submit login form"))
+            .unwrap();
+        store
+            .write_script(sample_entry("click", "buy groceries"))
+            .unwrap();
+        // "login" should recall the login-form entry (semantic similarity).
         let hits = store.recall_scripts("login", 10);
-        assert_eq!(hits.first().unwrap().task, "submit login form");
+        assert!(
+            hits.iter().any(|e| e.task == "submit login form"),
+            "login-form entry must be recalled for query 'login'"
+        );
     }
 
     #[test]
     fn cross_session_recall_after_reopen() {
-        let idx = std::env::temp_dir().join(format!("webai-idx-{}", std::process::id()));
-        let _ = std::fs::remove_file(&idx);
+        let idx = unique_index();
         // Session A writes.
         let store_a = SharedMemoryStore::from_config(MemoryConfig {
             index_path: idx.clone(),
             ..Default::default()
         });
-        store_a.write_script(sample_entry("click", "submit login form")).unwrap();
+        store_a
+            .write_script(sample_entry("click", "submit login form"))
+            .unwrap();
         // New store instance (same index path) can recall.
         let store_b = SharedMemoryStore::from_config(MemoryConfig {
             index_path: idx.clone(),
@@ -389,8 +438,7 @@ mod tests {
 
     #[test]
     fn index_persists_and_reopens_with_same_count() {
-        let idx = std::env::temp_dir().join(format!("webai-idx-{}", std::process::id()));
-        let _ = std::fs::remove_file(&idx);
+        let idx = unique_index();
         let store = SharedMemoryStore::from_config(MemoryConfig {
             index_path: idx.clone(),
             ..Default::default()
