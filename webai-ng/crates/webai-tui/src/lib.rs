@@ -9,6 +9,13 @@ use std::sync::Arc;
 
 use webai_agent::AgentSession;
 
+pub mod images;
+
+pub use images::{
+    detect_protocol, DispatchOutcome, ImagePipeline, ImageProtocol, IngestedImage,
+    PlaceholderReason,
+};
+
 /// An event streamed from the session backend to the frontend.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -52,7 +59,11 @@ mod tests {
             Arc::new(SharedMemoryStore::new()),
             vec![],
         ));
-        Arc::new(AgentSession::new(id, loop_, Arc::new(SharedMemoryStore::new())))
+        Arc::new(AgentSession::new(
+            id,
+            loop_,
+            Arc::new(SharedMemoryStore::new()),
+        ))
     }
 
     #[test]

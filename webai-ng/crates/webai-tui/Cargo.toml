@@ -21,6 +21,8 @@ crossterm = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 
+base64 = "0.22"
+
 [dev-dependencies]
 webai-llm = { path = "../webai-llm" }
 webai-memory = { path = "../webai-memory" }
