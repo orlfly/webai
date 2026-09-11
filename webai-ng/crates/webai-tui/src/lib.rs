@@ -9,6 +9,10 @@ use std::sync::Arc;
 
 use webai_agent::AgentSession;
 
+pub mod app;
+
+pub use app::{App, ChatLine, KeyAction, PAGE_ROWS, RENDER_TICK_MS};
+
 /// An event streamed from the session backend to the frontend.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -52,7 +56,11 @@ mod tests {
             Arc::new(SharedMemoryStore::new()),
             vec![],
         ));
-        Arc::new(AgentSession::new(id, loop_, Arc::new(SharedMemoryStore::new())))
+        Arc::new(AgentSession::new(
+            id,
+            loop_,
+            Arc::new(SharedMemoryStore::new()),
+        ))
     }
 
     #[test]
