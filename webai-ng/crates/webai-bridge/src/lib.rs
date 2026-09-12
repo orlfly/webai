@@ -15,13 +15,15 @@
 use webai_protocol::{
     codes, BrowserToolError, BrowserToolRequest, BrowserToolResponse, Request, Response,
 };
-use webai_script::{compose, ScriptError};
+use webai_script::ScriptError;
 use webai_webkit::{EvaluateResult, WebkitBridge, WebkitError};
 
 pub mod download;
 pub mod download_guard;
+pub mod perf;
 
 pub use download_guard::{sanitize_filename, FilenameError};
+pub use perf::{CacheKey, Clock, ComposeCache, ScreenshotDecision, ScreenshotThrottle};
 
 /// Structured error from the bridge layer.
 #[derive(Debug, thiserror::Error)]
@@ -50,11 +52,28 @@ fn wants_screenshot(verb: &webai_protocol::BrowserVerb) -> bool {
 /// The bridge dispatcher (ARCHITECTURE.md §4.8).
 pub struct Bridge {
     webkit: WebkitBridge,
+    /// Compose cache: same `verb + canonical args` never composes twice.
+    cache: perf::ComposeCache,
+    /// Screenshot throttle: mutating steps still record, bursts merge.
+    throttle: perf::ScreenshotThrottle,
 }
 
 impl Bridge {
     pub fn new(webkit: WebkitBridge) -> Self {
-        Self { webkit }
+        Self {
+            webkit,
+            cache: perf::ComposeCache::default(),
+            throttle: perf::ScreenshotThrottle::new(std::time::Duration::from_millis(0)),
+        }
+    }
+
+    /// Test/diagnostic access to the compose cache counters.
+    pub fn cache(&self) -> &perf::ComposeCache {
+        &self.cache
+    }
+
+    pub fn throttle(&self) -> &perf::ScreenshotThrottle {
+        &self.throttle
     }
 
     pub fn webkit(&self) -> &WebkitBridge {
@@ -109,7 +128,7 @@ impl Bridge {
         if req.verb == webai_protocol::BrowserVerb::Download {
             return self.handle_download(&req.args).await;
         }
-        let module = compose(req)?;
+        let module = self.cache.compose(req)?;
         let result = self
             .webkit
             .evaluate_javascript(&module.execute_src, 30_000)
