@@ -3,11 +3,14 @@
 //! The TUI frontend talks **only** to the session background service
 //! (`session`, ARCHITECTURE.md §4.11): it holds an `Arc<AgentSession>` and
 //! streams `SessionEvent`s out over a bounded mpsc channel. The frontend never
-//! imports the bridge/webkit layers directly (§2 boundary 1). The full ratatui
-//! app and image pipelines land in M5.
+//! imports the bridge/webkit layers directly (§2 boundary 1). `app` renders
+//! the streaming transcript with the §4.11 keymap; `images` (M5-3) adds the
+//! terminal image pipeline.
 
+pub mod app;
 pub mod session;
 
+pub use app::{App, ChatLine, KeyAction, PAGE_ROWS, RENDER_TICK_MS};
 pub use session::{PromptHandler, SessionBackend, COALESCE_STEP_BURST, EVENT_CHANNEL_CAPACITY};
 
 /// A command the frontend sends to the session background task.
