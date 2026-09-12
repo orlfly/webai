@@ -2210,7 +2210,10 @@ dependencies = [
 name = "webai-bridge-cxx"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "cxx",
+ "cxx-build",
+ "pkg-config",
  "serde",
  "serde_json",
  "thiserror",
@@ -2315,6 +2318,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "webai-bridge-cxx",
  "webai-protocol",
 ]
 

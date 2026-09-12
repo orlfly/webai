@@ -1,15 +1,26 @@
 //! WebkitBridge: FFI, load events, document-start injection.
 //!
-//! Stub skeleton for the webai-ng AI browser (M1-4). Defines the public bridge
-//! surface (ARCHITECTURE.md §4.6): `open`, `evaluate_javascript`,
-//! `wait_for_load`, `inject_user_script`, `screenshot`, plus the order-sensitive
-//! `BUNDLE_SCRIPT_ORDER` constant and the structured `WebkitError::CogLaunch`
-//! returned in no-FFI (stub) environments. Real FFI wiring lands with
-//! `webai-bridge-cxx` in M2.
+//! Defines the public bridge surface (ARCHITECTURE.md §4.6): `open`,
+//! `evaluate_javascript`, `wait_for_load`, `inject_user_script`, `screenshot`,
+//! plus the order-sensitive `BUNDLE_SCRIPT_ORDER` constant.
+//!
+//! The bridge is backed by `webai-bridge-cxx` (the real cog/WPE FFI). When the
+//! FFI backend is unavailable (no `legacy_cpp` feature, or launch fails), every
+//! operation returns a structured [`WebkitError::CogLaunch`] so upper layers can
+//! diagnose a missing environment instead of crashing. A canned-response test
+//! injection path lets the dispatch chain be covered on a dev machine with no
+//! WebKit.
+//!
+//! The page-side document-start bundle is embedded at compile time via
+//! `include_str!` (ARCHITECTURE.md §10: single binary + `page-bundle/`, no
+//! external script dependency at deploy time).
 
 use std::sync::{Arc, Mutex};
 
+use webai_bridge_cxx::{BridgeCxxError, LoadFinished, WebkitBridgeCxx};
+
 pub mod bundle;
+pub mod pool;
 
 pub use bundle::{
     concat_bundle, self_check, verify_order, BundleError, BundleReport, BUNDLE_SOURCES,
@@ -35,6 +46,89 @@ pub const BUNDLE_SCRIPT_ORDER: &[&str] = &[
     "legacy/playwright-shim.js",
 ];
 
+/// Fetch the source of a page-bundle script by its `BUNDLE_SCRIPT_ORDER` path.
+///
+/// Returns `None` if the path is not a known bundle entry. The content is
+/// embedded at compile time, so this never touches the filesystem at runtime.
+pub fn bundle_script(path: &str) -> Option<&'static str> {
+    if !BUNDLE_SCRIPT_ORDER.contains(&path) {
+        return None;
+    }
+    Some(match path {
+        "bridge-client.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/bridge-client.js"
+        )),
+        "parser/index.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/parser/index.js"
+        )),
+        "accessibility/index.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/accessibility/index.js"
+        )),
+        "dom.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/dom.js"
+        )),
+        "selector.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/selector.js"
+        )),
+        "events.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/events.js"
+        )),
+        "network.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/network.js"
+        )),
+        "storage.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/storage.js"
+        )),
+        "actions/navigate.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/actions/navigate.js"
+        )),
+        "actions/history.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/actions/history.js"
+        )),
+        "actions/interact.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/actions/interact.js"
+        )),
+        "actions/extract.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/actions/extract.js"
+        )),
+        "actions/screenshot.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/actions/screenshot.js"
+        )),
+        "actions/composite.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/actions/composite.js"
+        )),
+        "legacy/playwright-shim.js" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../page-bundle/legacy/playwright-shim.js"
+        )),
+        _ => unreachable!("BUNDLE_SCRIPT_ORDER membership already checked"),
+    })
+}
+
+/// Iterate the full bundle in `BUNDLE_SCRIPT_ORDER`, yielding `(path, source)`.
+pub fn bundle_scripts() -> impl Iterator<Item = (&'static str, &'static str)> {
+    BUNDLE_SCRIPT_ORDER.iter().map(|path| {
+        (
+            *path,
+            bundle_script(path).expect("bundle entry must have embedded source"),
+        )
+    })
+}
+
 /// WebKit bridge errors (ARCHITECTURE.md §7).
 #[derive(Debug, thiserror::Error)]
 pub enum WebkitError {
@@ -47,6 +141,15 @@ pub enum WebkitError {
     ScriptError(String),
     #[error("load failed: {0}")]
     LoadFailed(String),
+}
+
+impl From<BridgeCxxError> for WebkitError {
+    fn from(e: BridgeCxxError) -> Self {
+        match e {
+            BridgeCxxError::CogLaunch(msg) => WebkitError::CogLaunch(msg),
+            BridgeCxxError::Ffi(msg) => WebkitError::ScriptError(msg),
+        }
+    }
 }
 
 /// Result of an evaluate call.
@@ -65,38 +168,95 @@ pub struct LoadSnapshot {
     pub status: String,
 }
 
+/// A oneshot load-wait subscription, woken by the `WEBKIT_LOAD_FINISHED`
+/// trampoline.
+struct LoadWaiter {
+    tx: tokio::sync::oneshot::Sender<LoadSnapshot>,
+}
+
 /// Thread-safe handle to the WebKit view. All calls are serialized via an
 /// internal `Mutex` (single-thread affinity per ARCHITECTURE.md §6).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WebkitBridge {
-    // In stub mode we carry no *mut view; M2 wires the cog/WPE pointer here.
-    #[allow(dead_code)] // consumed by the FFI backend (M2)
-    view: Arc<Mutex<Option<u64>>>,
-    stub_mode: bool,
+    /// The real FFI backend (cog/WPE). `None` when no FFI environment.
+    backend: Arc<Mutex<Option<WebkitBridgeCxx>>>,
+    /// The last URI observed on `WEBKIT_LOAD_FINISHED`.
+    last_load_uri: Arc<Mutex<Option<String>>>,
+    /// Pending load-waiters to wake on the next `WEBKIT_LOAD_FINISHED`.
+    load_waiters: Arc<Mutex<Vec<LoadWaiter>>>,
+    /// Canned-response injection for tests (no FFI needed).
+    canned: Arc<Mutex<Option<CannedBackend>>>,
+}
+
+/// A canned backend for tests: returns scripted responses without WebKit.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CannedBackend {
+    pub(crate) evaluate_result: Option<serde_json::Value>,
+    pub(crate) screenshot_png: Option<Vec<u8>>,
+    pub(crate) load_events: Vec<LoadSnapshot>,
 }
 
 impl WebkitBridge {
-    /// Construct a stub bridge. With FFI absent every operation returns a
-    /// structured [`WebkitError::CogLaunch`].
+    /// Construct a bridge. Attempts to launch the real FFI backend; if that
+    /// fails (no `legacy_cpp` feature, or cog/WPE unavailable), the bridge
+    /// operates in no-FFI mode where every operation returns
+    /// [`WebkitError::CogLaunch`].
     pub fn new() -> Self {
-        Self {
-            view: Arc::new(Mutex::new(None)),
-            stub_mode: true,
+        let mut backend = WebkitBridgeCxx::default();
+        let launched = backend.launch().is_ok();
+        let backend = if launched { Some(backend) } else { None };
+        let bridge = Self {
+            backend: Arc::new(Mutex::new(backend)),
+            last_load_uri: Arc::new(Mutex::new(None)),
+            load_waiters: Arc::new(Mutex::new(Vec::new())),
+            canned: Arc::new(Mutex::new(None)),
+        };
+        // Wire the LOAD_FINISHED trampoline: the cxx bridge calls this closure
+        // on the loop thread when WEBKIT_LOAD_FINISHED fires.
+        if let Some(b) = bridge.backend.lock().unwrap().as_mut() {
+            let bridge_for_cb = bridge.clone();
+            b.set_load_callback(move |event: LoadFinished| {
+                bridge_for_cb.on_load_finished(event);
+            });
         }
+        bridge
+    }
+
+    /// Construct a bridge with a canned backend for tests (no FFI needed).
+    #[cfg(test)]
+    pub(crate) fn with_canned(canned: CannedBackend) -> Self {
+        Self {
+            backend: Arc::new(Mutex::new(None)),
+            last_load_uri: Arc::new(Mutex::new(None)),
+            load_waiters: Arc::new(Mutex::new(Vec::new())),
+            canned: Arc::new(Mutex::new(Some(canned))),
+        }
+    }
+
+    /// Whether the real FFI backend is available.
+    pub fn is_ffi_available(&self) -> bool {
+        self.backend.lock().unwrap().is_some()
     }
 
     /// Navigate the view to `url` and wait for load.
     pub async fn open(&self, url: &str) -> Result<LoadSnapshot, WebkitError> {
-        if self.stub_mode {
-            return Err(WebkitError::CogLaunch(format!(
-                "no FFI environment (open {url}); configure webai-bridge-cxx and run with the cog bridge"
-            )));
+        // Canned path (tests).
+        if let Some(canned) = self.canned.lock().unwrap().as_ref() {
+            if let Some(ev) = canned.load_events.first() {
+                return Ok(ev.clone());
+            }
         }
-        Ok(LoadSnapshot {
-            url: url.into(),
-            title: String::new(),
-            status: "finished".into(),
-        })
+        {
+            let backend = self.backend.lock().unwrap();
+            let backend = backend.as_ref().ok_or_else(|| {
+                WebkitError::CogLaunch(format!(
+                    "no FFI environment (open {url}); configure webai-bridge-cxx and run with the cog bridge"
+                ))
+            })?;
+            backend.load_uri(url)?;
+        } // drop the lock before awaiting
+          // Wait for the load to finish (oneshot).
+        self.wait_for_load(15_000).await
     }
 
     /// Evaluate a JavaScript snippet, injecting `window.__webkit_args__`.
@@ -105,37 +265,117 @@ impl WebkitBridge {
         src: &str,
         timeout_ms: u64,
     ) -> Result<EvaluateResult, WebkitError> {
-        let _ = (src, timeout_ms);
-        if self.stub_mode {
-            return Err(WebkitError::CogLaunch(
-                "no FFI environment; cannot evaluate_javascript in stub mode".into(),
-            ));
+        // Canned path (tests).
+        if let Some(canned) = self.canned.lock().unwrap().as_ref() {
+            if let Some(json) = canned.evaluate_result.clone() {
+                return Ok(EvaluateResult {
+                    json,
+                    screenshot_path: None,
+                });
+            }
         }
+        let backend = self.backend.lock().unwrap();
+        let backend = backend.as_ref().ok_or_else(|| {
+            WebkitError::CogLaunch(
+                "no FFI environment; cannot evaluate_javascript in stub mode".into(),
+            )
+        })?;
+        let payload = backend.evaluate(src, timeout_ms as u32)?;
+        // The C++ side returns `{"ok":true,"value":<json>}` or
+        // `{"ok":false,"error":"..."}`.
+        let parsed: serde_json::Value = serde_json::from_str(&payload)
+            .map_err(|e| WebkitError::ScriptError(format!("invalid evaluate payload: {e}")))?;
+        if parsed.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            // Surface the JS exception text verbatim (定论二); never fall back
+            // to a generic "unknown error".
+            let msg = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!("script failed with no error detail: {parsed}")
+                });
+            return Err(WebkitError::ScriptError(msg));
+        }
+        let json = parsed
+            .get("value")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         Ok(EvaluateResult {
-            json: serde_json::Value::Null,
+            json,
             screenshot_path: None,
         })
     }
 
+    /// Wait for the next `WEBKIT_LOAD_FINISHED`, or time out.
+    pub async fn wait_for_load(&self, timeout_ms: u64) -> Result<LoadSnapshot, WebkitError> {
+        // Canned path (tests): if a load event is queued, return it.
+        if let Some(canned) = self.canned.lock().unwrap().as_ref() {
+            if let Some(ev) = canned.load_events.first() {
+                return Ok(ev.clone());
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.load_waiters.lock().unwrap().push(LoadWaiter { tx });
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx).await {
+            Ok(Ok(snapshot)) => Ok(snapshot),
+            Ok(Err(_)) => Err(WebkitError::LoadFailed("load waiter dropped".into())),
+            Err(_) => Err(WebkitError::Timeout(timeout_ms)),
+        }
+    }
+
     /// Register a document-start user script.
     pub async fn inject_user_script(&self, src: &str) -> Result<(), WebkitError> {
-        let _ = src;
-        if self.stub_mode {
-            return Err(WebkitError::CogLaunch(
-                "no FFI environment; cannot inject_user_script in stub mode".into(),
-            ));
+        // Canned path (tests): no-op success.
+        if self.canned.lock().unwrap().is_some() {
+            return Ok(());
         }
+        let backend = self.backend.lock().unwrap();
+        let backend = backend.as_ref().ok_or_else(|| {
+            WebkitError::CogLaunch(
+                "no FFI environment; cannot inject_user_script in stub mode".into(),
+            )
+        })?;
+        backend.inject_user_script(src)?;
         Ok(())
     }
 
     /// Capture a viewport PNG.
     pub async fn screenshot(&self) -> Result<Vec<u8>, WebkitError> {
-        if self.stub_mode {
-            return Err(WebkitError::CogLaunch(
-                "no FFI environment; cannot screenshot in stub mode".into(),
-            ));
+        // Canned path (tests).
+        if let Some(canned) = self.canned.lock().unwrap().as_ref() {
+            if let Some(png) = canned.screenshot_png.clone() {
+                return Ok(png);
+            }
         }
-        Ok(Vec::new())
+        let backend = self.backend.lock().unwrap();
+        let backend = backend.as_ref().ok_or_else(|| {
+            WebkitError::CogLaunch("no FFI environment; cannot screenshot in stub mode".into())
+        })?;
+        // The bridge-cxx screenshot writes to a temp file; read it back.
+        let path = std::env::temp_dir().join(format!("webai-shot-{}.png", std::process::id()));
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| WebkitError::ScriptError("temp path not UTF-8".into()))?;
+        backend.screenshot(path_str)?;
+        let bytes = std::fs::read(&path)
+            .map_err(|e| WebkitError::ScriptError(format!("read screenshot: {e}")))?;
+        let _ = std::fs::remove_file(&path);
+        Ok(bytes)
+    }
+
+    /// Handle a `WEBKIT_LOAD_FINISHED` event from the FFI trampoline.
+    fn on_load_finished(&self, event: LoadFinished) {
+        *self.last_load_uri.lock().unwrap() = Some(event.uri.clone());
+        let snapshot = LoadSnapshot {
+            url: event.uri,
+            title: event.title,
+            status: "finished".into(),
+        };
+        let waiters = std::mem::take(&mut *self.load_waiters.lock().unwrap());
+        for w in waiters {
+            let _ = w.tx.send(snapshot.clone());
+        }
     }
 }
 
@@ -159,21 +399,78 @@ mod tests {
         assert!(BUNDLE_SCRIPT_ORDER.contains(&"actions/screenshot.js"));
     }
 
-    #[tokio::test]
-    async fn stub_mode_returns_structured_cog_launch_error() {
-        let bridge = WebkitBridge::new();
-        let err = bridge.open("https://example.com").await.unwrap_err();
-        match err {
-            WebkitError::CogLaunch(msg) => {
-                assert!(msg.contains("no FFI environment"));
-            }
-            other => panic!("expected CogLaunch, got {other:?}"),
+    #[test]
+    fn bundle_has_exactly_15_entries_in_documented_order() {
+        let expected = [
+            "bridge-client.js",
+            "parser/index.js",
+            "accessibility/index.js",
+            "dom.js",
+            "selector.js",
+            "events.js",
+            "network.js",
+            "storage.js",
+            "actions/navigate.js",
+            "actions/history.js",
+            "actions/interact.js",
+            "actions/extract.js",
+            "actions/screenshot.js",
+            "actions/composite.js",
+            "legacy/playwright-shim.js",
+        ];
+        assert_eq!(BUNDLE_SCRIPT_ORDER.len(), 15, "must be exactly 15 entries");
+        assert_eq!(
+            BUNDLE_SCRIPT_ORDER, &expected,
+            "order must match ARCHITECTURE.md §4.6"
+        );
+    }
+
+    #[test]
+    fn every_bundle_entry_has_nonempty_embedded_source() {
+        for (path, src) in bundle_scripts() {
+            assert!(!src.trim().is_empty(), "bundle entry {path} is empty");
         }
     }
 
+    #[test]
+    fn bundle_script_returns_none_for_unknown_path() {
+        assert!(bundle_script("not/a/real/script.js").is_none());
+    }
+
+    #[test]
+    fn bridge_client_installs_webkit_bridge_global() {
+        let src = bundle_script("bridge-client.js").expect("bridge-client embedded");
+        assert!(
+            src.contains("window.__webkitBridge"),
+            "must install __webkitBridge"
+        );
+        assert!(src.contains("__webkitBridgeLoaded"), "must signal loaded");
+    }
+
+    #[test]
+    fn playwright_shim_declares_its_dependencies() {
+        let src = bundle_script("legacy/playwright-shim.js").expect("shim embedded");
+        assert!(src.contains("WebkitAiDom"), "shim depends on WebkitAiDom");
+        assert!(
+            src.contains("DEPENDENCIES"),
+            "shim must declare dependencies"
+        );
+    }
+
     #[tokio::test]
-    async fn stub_evaluate_and_screenshot_also_report_cog_launch() {
-        let bridge = WebkitBridge::new();
+    async fn no_ffi_returns_structured_cog_launch_error() {
+        // A bridge with no FFI backend and no canned backend.
+        let bridge = WebkitBridge {
+            backend: Arc::new(Mutex::new(None)),
+            last_load_uri: Arc::new(Mutex::new(None)),
+            load_waiters: Arc::new(Mutex::new(Vec::new())),
+            canned: Arc::new(Mutex::new(None)),
+        };
+        let err = bridge.open("https://example.com").await.unwrap_err();
+        match err {
+            WebkitError::CogLaunch(msg) => assert!(msg.contains("no FFI environment")),
+            other => panic!("expected CogLaunch, got {other:?}"),
+        }
         assert!(matches!(
             bridge.evaluate_javascript("1+1", 100).await,
             Err(WebkitError::CogLaunch(_))
@@ -186,5 +483,66 @@ mod tests {
             bridge.inject_user_script("x").await,
             Err(WebkitError::CogLaunch(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn canned_evaluate_returns_scripted_json() {
+        let bridge = WebkitBridge::with_canned(CannedBackend {
+            evaluate_result: Some(serde_json::json!(2)),
+            ..Default::default()
+        });
+        let res = bridge.evaluate_javascript("1+1", 1000).await.unwrap();
+        assert_eq!(res.json, serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn canned_screenshot_returns_png_magic() {
+        let png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let bridge = WebkitBridge::with_canned(CannedBackend {
+            screenshot_png: Some(png.clone()),
+            ..Default::default()
+        });
+        let bytes = bridge.screenshot().await.unwrap();
+        assert_eq!(
+            &bytes[..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_load_times_out_without_event() {
+        let bridge = WebkitBridge {
+            backend: Arc::new(Mutex::new(None)),
+            last_load_uri: Arc::new(Mutex::new(None)),
+            load_waiters: Arc::new(Mutex::new(Vec::new())),
+            canned: Arc::new(Mutex::new(None)),
+        };
+        let err = bridge.wait_for_load(50).await.unwrap_err();
+        assert!(matches!(err, WebkitError::Timeout(50)));
+    }
+
+    #[tokio::test]
+    async fn load_finished_wakes_oneshot_waiter() {
+        let bridge = WebkitBridge {
+            backend: Arc::new(Mutex::new(None)),
+            last_load_uri: Arc::new(Mutex::new(None)),
+            load_waiters: Arc::new(Mutex::new(Vec::new())),
+            canned: Arc::new(Mutex::new(None)),
+        };
+        let bridge2 = bridge.clone();
+        let handle = tokio::spawn(async move { bridge2.wait_for_load(1000).await.unwrap() });
+        // Give the waiter a moment to register.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        bridge.on_load_finished(LoadFinished {
+            uri: "https://example.com".into(),
+            title: "Example".into(),
+            status: 3,
+        });
+        let snapshot = handle.await.unwrap();
+        assert_eq!(snapshot.url, "https://example.com");
+        assert_eq!(
+            bridge.last_load_uri.lock().unwrap().as_deref().unwrap(),
+            "https://example.com"
+        );
     }
 }
