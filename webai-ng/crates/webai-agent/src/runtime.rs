@@ -303,4 +303,56 @@ mod tests {
         let modes = [LaunchMode::Tui, LaunchMode::Serve, LaunchMode::Headless];
         assert_eq!(modes.len(), 3);
     }
+
+    /// M-3 crash-recovery fuzz: kill -9 at any byte offset (simulated by
+    /// truncating the file at every possible point) must never fail wholesale;
+    /// recovery always yields the complete lines only.
+    #[test]
+    fn crash_recovery_fuzz_truncation_at_any_offset() {
+        let dir = config_dir("fuzz");
+        let valid = "{\"role\":\"user\",\"text\":\"step-1\"}\n\
+                     {\"role\":\"assistant\",\"text\":\"step-2\"}\n\
+                     {\"role\":\"user\",\"text\":\"step-3\"}\n";
+        let path = dir.join("fuzz-sess.jsonl");
+        write(&path, valid);
+
+        // Sanity: full file recovers 3 lines.
+        let (_, lines) = resume_transcript(&path).unwrap();
+        assert_eq!(lines.len(), 3);
+
+        // Truncate at every byte offset from 1..len; recovery must never
+        // panic or error, and must return at most 3 valid lines with no
+        // partial JSON.
+        for cut in 1..valid.len() {
+            let truncated = &valid[..cut];
+            write(&path, truncated);
+            let (_, lines) = resume_transcript(&path).unwrap();
+            assert!(lines.len() <= 3, "cut at {cut} recovered {}", lines.len());
+            for l in &lines {
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(l).is_ok(),
+                    "cut at {cut} produced invalid line: {l}"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// M-3: corruption in the middle (not just the tail) also skips cleanly;
+    /// recovery keeps all intact lines around the bad one.
+    #[test]
+    fn crash_recovery_skips_midfile_corruption() {
+        let dir = config_dir("midcorrupt");
+        let path = dir.join("mid.jsonl");
+        write(
+            &path,
+            "{\"role\":\"user\",\"text\":\"a\"}\n\
+             GARBAGE-NOT-JSON\n\
+             {\"role\":\"assistant\",\"text\":\"c\"}\n",
+        );
+        let (id, lines) = resume_transcript(&path).unwrap();
+        assert_eq!(id, "mid");
+        assert_eq!(lines.len(), 2, "only the valid lines survive");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
