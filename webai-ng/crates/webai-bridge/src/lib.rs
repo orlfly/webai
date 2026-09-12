@@ -19,6 +19,9 @@ use webai_script::{compose, ScriptError};
 use webai_webkit::{EvaluateResult, WebkitBridge, WebkitError};
 
 pub mod download;
+pub mod download_guard;
+
+pub use download_guard::{sanitize_filename, FilenameError};
 
 /// Structured error from the bridge layer.
 #[derive(Debug, thiserror::Error)]
