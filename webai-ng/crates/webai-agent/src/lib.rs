@@ -48,7 +48,11 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
-    pub fn new(llm: Arc<LlmClient>, memory: Arc<SharedMemoryStore>, tools: Vec<Arc<dyn Tool>>) -> Self {
+    pub fn new(
+        llm: Arc<LlmClient>,
+        memory: Arc<SharedMemoryStore>,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Self {
         Self::with_config(llm, memory, tools, LoopConfig::default())
     }
 
@@ -111,7 +115,11 @@ impl std::fmt::Debug for AgentSession {
 }
 
 impl AgentSession {
-    pub fn new(session_id: impl Into<String>, loop_: Arc<AgentLoop>, memory: Arc<SharedMemoryStore>) -> Self {
+    pub fn new(
+        session_id: impl Into<String>,
+        loop_: Arc<AgentLoop>,
+        memory: Arc<SharedMemoryStore>,
+    ) -> Self {
         Self {
             session_id: session_id.into(),
             transcript: Mutex::new(Vec::new()),

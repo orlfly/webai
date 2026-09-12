@@ -147,13 +147,20 @@ pub fn recovery_from_persisted_step(path: &Path) -> Vec<Json> {
 mod tests {
     use super::*;
 
-    fn temp_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("webai-jsonl-{}", std::process::id()))
+    fn temp_dir(name: &str) -> PathBuf {
+        // Unique per test (test name + nanos): the pid alone collides when
+        // all tests share one process and a parallel run's remove_dir_all
+        // races with another test's create_dir_all (Major-1 on #51).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("webai-jsonl-{name}-{}-{nanos}", std::process::id()))
     }
 
     #[test]
     fn write_flush_is_immediately_visible() {
-        let dir = temp_dir();
+        let dir = temp_dir("write_flush");
         let mut log = JsonlSessionLog::open(&dir, "s1").unwrap();
         log.record_user_prompt("hello").unwrap();
         // After record (which flushes), the file must contain the line.
@@ -165,7 +172,7 @@ mod tests {
 
     #[test]
     fn record_all_kinds_writes_lines() {
-        let dir = temp_dir();
+        let dir = temp_dir("record_all_kinds");
         let mut log = JsonlSessionLog::open(&dir, "s2").unwrap();
         log.record_user_prompt("hi").unwrap();
         log.record_step(&serde_json::json!({ "tool": "browser.click" }))
@@ -179,7 +186,7 @@ mod tests {
 
     #[test]
     fn recovery_drops_trailing_truncated_line() {
-        let dir = temp_dir();
+        let dir = temp_dir("drops_trailing");
         let path = dir.join("s3.jsonl");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -194,7 +201,7 @@ mod tests {
 
     #[test]
     fn recovery_skips_bad_middle_line() {
-        let dir = temp_dir();
+        let dir = temp_dir("skips_middle");
         let path = dir.join("s4.jsonl");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -213,7 +220,7 @@ mod tests {
 
     #[test]
     fn recovery_empty_or_missing_file_returns_empty() {
-        let dir = temp_dir();
+        let dir = temp_dir("empty_missing");
         let path = dir.join("missing.jsonl");
         assert!(recovery_from_persisted_step(&path).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
