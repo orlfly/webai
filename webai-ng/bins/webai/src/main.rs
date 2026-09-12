@@ -11,6 +11,7 @@
 //! - `--resume <session.jsonl>`: resume a persisted transcript (FR-5)
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use webai_agent::runtime::{self, LaunchMode, LaunchOutcome, RuntimeError};
 
@@ -21,6 +22,7 @@ fn main() {
     let mut public = false;
     let mut config_dir: Option<PathBuf> = None;
     let mut resume: Option<PathBuf> = None;
+    let mut prompt: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -28,6 +30,9 @@ fn main() {
             "--serve" => mode = LaunchMode::Serve,
             "--headless" => mode = LaunchMode::Headless,
             "--public" => public = true,
+            "--prompt" => {
+                prompt = it.next().map(String::from);
+            }
             "--resume" => {
                 resume = it.next().map(PathBuf::from);
             }
@@ -50,7 +55,7 @@ fn main() {
         }
     }
 
-    match run(mode, public, config_dir, resume) {
+    match run(mode, public, config_dir, resume, prompt) {
         Ok(()) => {}
         Err(e) => {
             // Structured, human-readable startup error (no bare "unknown error").
@@ -77,12 +82,14 @@ fn print_help() {
 }
 
 /// All assembly delegated to the runtime module; the binary has no business
-/// logic (thin-binary rule).
+/// logic beyond handing the frontend entry points to the runtime (thin-binary
+/// rule; layering `agent < {acp, tui} < bins/webai`).
 fn run(
     mode: LaunchMode,
     public: bool,
     config_dir: Option<PathBuf>,
     resume: Option<PathBuf>,
+    prompt: Option<String>,
 ) -> Result<(), RuntimeError> {
     // --public without pairing credentials is refused at startup.
     runtime::check_public_gate(public, std::env::var_os("WEBAI_PAIRING_KEY").is_some())?;
@@ -92,7 +99,9 @@ fn run(
     });
     let rt = runtime::bootstrap(&dir)?;
 
-    // Resume wiring: rebuild a persisted transcript if requested (FR-5).
+    // Resume wiring: rebuild a persisted transcript if requested (FR-5). The
+    // transcript is validated with `transcript_from_jsonl` inside the runtime
+    // (schema-checked records; a trailing truncated line is tolerated).
     if let Some(path) = resume {
         let (session_id, lines) = runtime::resume_transcript(&path)?;
         println!(
@@ -101,16 +110,46 @@ fn run(
         );
     }
 
-    match runtime::launch(&rt, mode) {
-        LaunchOutcome::Tui => {
-            println!("webai: TUI mode (interactive UI lands in M6)");
-        }
-        LaunchOutcome::Serve => {
-            println!("webai: ACP serve mode (server transport lands in M6)");
-        }
-        LaunchOutcome::Headless => {
-            println!("webai: headless mode");
-        }
+    let hooks = runtime::LaunchHooks {
+        tui: Box::new(|rt| {
+            // TUI: assemble the shared AgentSession and run the backend run
+            // loop (webai_tui::session::serve). The App is driven from the
+            // SessionEvents; terminal rendering lands with M6-2.
+            let session = webai_agent::AgentSession::new(
+                "local",
+                runtime::build_agent_loop(rt),
+                webai_agent::memory_store(rt),
+            );
+            let handler: Arc<dyn webai_tui::session::PromptHandler> =
+                Arc::new(webai_tui::session::LoopPromptHandler);
+            let backend =
+                webai_tui::session::SessionBackend::spawn(std::sync::Arc::new(session), handler);
+            let runtime =
+                tokio::runtime::Runtime::new().map_err(|e| RuntimeError::Io(e.to_string()))?;
+            runtime.block_on(async {
+                backend
+                    .close()
+                    .await
+                    .map_err(|e| RuntimeError::Io(e.to_string()))?;
+                Ok::<(), RuntimeError>(())
+            })?;
+            println!("webai: TUI session loop finished");
+            Ok(())
+        }),
+        serve: Box::new(|rt| {
+            // Serve: ACP JSON-RPC dispatcher with a per-session registry.
+            let _registry = webai_acp::AcpSessionRegistry::new();
+            let _loop_ = runtime::build_agent_loop(rt);
+            println!("webai: ACP dispatcher assembled; WS transport lands in M6-3");
+            Ok(())
+        }),
+    };
+
+    let outcome = runtime::launch(&rt, mode, Some(&hooks), prompt.as_deref())?;
+    match outcome {
+        LaunchOutcome::Tui => println!("webai: TUI mode finished"),
+        LaunchOutcome::Serve => println!("webai: serve mode finished"),
+        LaunchOutcome::Headless => println!("webai: headless mode finished"),
     }
     Ok(())
 }

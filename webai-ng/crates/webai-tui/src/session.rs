@@ -165,6 +165,29 @@ fn emit_bounded(tx: &mpsc::Sender<SessionEvent>, ev: SessionEvent) -> bool {
     }
 }
 
+/// The default prompt handler: emits the prompt observation as a Step and a
+/// Done event. The agent loop backends (LLM / browser tool) attach through
+/// `AgentSession` on the M6 run loop; this keeps the frontend loop testable.
+pub struct LoopPromptHandler;
+
+impl PromptHandler for LoopPromptHandler {
+    fn run(&self, prompt: &str, emit: &mut dyn FnMut(SessionEvent)) -> Result<(), String> {
+        use webai_protocol::AgentStep;
+        let step = AgentStep {
+            tool_name: "prompt".into(),
+            observation: Some(prompt.to_owned()),
+            image: None,
+            reused_script: false,
+        };
+        emit(SessionEvent::Step { step });
+        let done = SessionEvent::Done {
+            state: crate::done_state(Ok(())),
+        };
+        emit(done);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

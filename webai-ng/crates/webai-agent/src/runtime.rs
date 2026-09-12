@@ -39,6 +39,10 @@ pub enum RuntimeError {
     UnknownLlmProfile { profile: String },
     #[error("--public requires pairing credentials (FR-8 network boundary)")]
     PublicWithoutPairing,
+    #[error("config parse failed: {} ({detail})", path.display())]
+    ConfigParse { path: PathBuf, detail: String },
+    #[error("no {mode} frontend hook was injected by the binary")]
+    MissingHook { mode: &'static str },
     #[error("io error: {0}")]
     Io(String),
 }
@@ -50,9 +54,7 @@ impl From<ConfigError> for RuntimeError {
                 file: "config",
                 key: name,
             },
-            ConfigError::Parse { path, detail } => {
-                RuntimeError::Io(format!("{}: {detail}", path.display()))
-            }
+            ConfigError::Parse { path, detail } => RuntimeError::ConfigParse { path, detail },
             ConfigError::UnknownLlmProfile(p) => RuntimeError::UnknownLlmProfile { profile: p },
         }
     }
@@ -109,14 +111,91 @@ pub enum LaunchOutcome {
     Headless,
 }
 
+/// Frontend entry points injected by the binary (thin-binary rule §3.3, and
+/// the §3.2 layering rule `agent < {acp, tui}`: this crate cannot depend on
+/// the frontend crates, so the binary hands the entry points in).
+/// A frontend entry point handed in by the binary.
+pub type LaunchHook = Box<dyn Fn(&Runtime) -> Result<(), RuntimeError>>;
+
+pub struct LaunchHooks {
+    /// TUI entry: builds the session backend and runs the App loop.
+    pub tui: LaunchHook,
+    /// ACP serve entry: starts the JSON-RPC dispatcher transports.
+    pub serve: LaunchHook,
+}
+
+impl std::fmt::Debug for LaunchHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchHooks").finish_non_exhaustive()
+    }
+}
+
 /// Launch the runtime in the requested mode. The binary only calls this; all
 /// wiring lives in this module (thin-binary rule §3.3).
-pub fn launch(rt: &Runtime, mode: LaunchMode) -> LaunchOutcome {
-    let _ = rt;
+///
+/// - `Tui` / `Serve` delegate to the injected frontend hooks.
+/// - `Headless` runs the AgentLoop end to end inside this module: assemble the
+///   runner from the runtime services and execute one prompt via the loop
+///   driver (`AgentRunner::run`) with a passing-through executor.
+pub fn launch(
+    rt: &Runtime,
+    mode: LaunchMode,
+    hooks: Option<&LaunchHooks>,
+    prompt: Option<&str>,
+) -> Result<LaunchOutcome, RuntimeError> {
     match mode {
-        LaunchMode::Tui => LaunchOutcome::Tui,
-        LaunchMode::Serve => LaunchOutcome::Serve,
-        LaunchMode::Headless => LaunchOutcome::Headless,
+        LaunchMode::Tui => {
+            let hooks = hooks.ok_or(RuntimeError::MissingHook { mode: "tui" })?;
+            (hooks.tui)(rt)?;
+            Ok(LaunchOutcome::Tui)
+        }
+        LaunchMode::Serve => {
+            let hooks = hooks.ok_or(RuntimeError::MissingHook { mode: "serve" })?;
+            (hooks.serve)(rt)?;
+            Ok(LaunchOutcome::Serve)
+        }
+        LaunchMode::Headless => {
+            run_headless(rt, prompt.unwrap_or_default())?;
+            Ok(LaunchOutcome::Headless)
+        }
+    }
+}
+
+/// Headless mode: run one prompt through the plan-act-observe driver and print
+/// the final observation to stdout. Uses the pass-through executor (headless
+/// runs are script/composition driven; the browser tool lands with the FFI
+/// backend) so the run is honest about what executed.
+fn run_headless(rt: &Runtime, prompt: &str) -> Result<(), RuntimeError> {
+    use crate::runner::{AgentRunner, RunConfig, StepOutcome, StubExecutor};
+
+    let loop_config = RunConfig {
+        max_steps: 30,
+        duplicate_threshold: 2,
+        auto_plan_on_multi_step: true,
+        script_memory_enabled: true,
+    };
+    let summariser =
+        crate::summariser::HistorySummariser::new(crate::summariser::SummariserConfig::default());
+    let runner = AgentRunner::new(loop_config, (*rt.memory).clone(), summariser);
+    let exec = StubExecutor::default();
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| RuntimeError::Io(e.to_string()))?;
+    let (steps, outcome, _plan) =
+        runtime.block_on(async { runner.run(prompt, &exec, &rt.llm).await });
+
+    for step in &steps {
+        println!(
+            "[step] {} -> {}",
+            step.tool_name,
+            step.observation.as_deref().unwrap_or("")
+        );
+    }
+    match outcome {
+        StepOutcome::Done { state, message } => {
+            println!("done ({state}): {}", message.unwrap_or_default());
+            Ok(())
+        }
+        StepOutcome::Guard(err) => Err(RuntimeError::Io(format!("guard: {err}"))),
+        StepOutcome::Error { code, message } => Err(RuntimeError::Io(format!("{code}: {message}"))),
     }
 }
 
@@ -135,9 +214,12 @@ pub fn scan_sessions(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Rebuild the transcript from a persisted JSONL file, skipping a trailing
-/// truncated/invalid line (FR-5: resume from the last complete record).
-/// Returns `(session_id, transcript_lines)`.
+/// Rebuild the transcript from a persisted JSONL file (FR-5 / M-3): every
+/// line must parse as a transcript record via `transcript_from_jsonl`
+/// (schema-validated `{"role", "text"}`); a trailing truncated/invalid line is
+/// skipped (single-line loss is the documented crash-recovery bound). An
+/// invalid line that is *not* at the end of the file is a structured error.
+/// Returns `(session_id, transcript_lines)` with raw JSONL text preserved.
 pub fn resume_transcript(path: &Path) -> Result<(String, Vec<String>), RuntimeError> {
     let session_id = path
         .file_stem()
@@ -146,19 +228,29 @@ pub fn resume_transcript(path: &Path) -> Result<(String, Vec<String>), RuntimeEr
         .to_string();
     let raw = std::fs::read_to_string(path).map_err(|e| RuntimeError::Io(e.to_string()))?;
     let mut lines = Vec::new();
-    for line in raw.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if serde_json::from_str::<serde_json::Value>(line).is_ok() {
-            lines.push(line.to_string());
-        } else {
-            // Truncated trailing line: skip it (single-line loss is the
-            // documented crash-recovery bound).
-            continue;
+    let total: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    for (i, line) in total.iter().enumerate() {
+        match crate::session::transcript_from_jsonl(line) {
+            Some(_) => lines.push((*line).to_string()),
+            None => {
+                let is_last = i + 1 == total.len();
+                if is_last {
+                    // Truncated trailing record: tolerated (M-3 bound).
+                    continue;
+                }
+                return Err(RuntimeError::ConfigParse {
+                    path: path.to_path_buf(),
+                    detail: format!("invalid transcript record at line {}", i + 1),
+                });
+            }
         }
     }
     Ok((session_id, lines))
+}
+
+/// The runtime's shared memory store (borrowed view for frontend assembly).
+pub fn memory_store(rt: &Runtime) -> Arc<SharedMemoryStore> {
+    Arc::clone(&rt.memory)
 }
 
 /// The assembled `AgentLoop` for a runtime (thin helper the frontends share).
@@ -338,10 +430,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// M-3: corruption in the middle (not just the tail) also skips cleanly;
-    /// recovery keeps all intact lines around the bad one.
+    /// M-3 tightened by task 62: mid-file corruption is a structured
+    /// ConfigParse error (schema validation rejects bad records); only a
+    /// trailing truncated line is tolerated.
     #[test]
-    fn crash_recovery_skips_midfile_corruption() {
+    fn crash_recovery_midfile_corruption_is_structured_error() {
         let dir = config_dir("midcorrupt");
         let path = dir.join("mid.jsonl");
         write(
@@ -350,9 +443,72 @@ mod tests {
              GARBAGE-NOT-JSON\n\
              {\"role\":\"assistant\",\"text\":\"c\"}\n",
         );
-        let (id, lines) = resume_transcript(&path).unwrap();
-        assert_eq!(id, "mid");
-        assert_eq!(lines.len(), 2, "only the valid lines survive");
+        let err = resume_transcript(&path).unwrap_err();
+        match err {
+            RuntimeError::ConfigParse { detail, .. } => {
+                assert!(detail.contains("line 2"), "unexpected detail: {detail}")
+            }
+            other => panic!("expected ConfigParse, got {other:?}"),
+        }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn headless_launch_runs_the_loop_and_completes() {
+        let dir = config_dir("headless");
+        write(&dir.join("agent.toml"), agent_toml());
+        write(&dir.join("llm.toml"), llm_toml());
+        let rt = bootstrap(&dir).expect("bootstrap must succeed with a minimal config");
+
+        let outcome = launch(&rt, LaunchMode::Headless, None, Some("open example.com"))
+            .expect("headless launch must complete");
+        assert_eq!(outcome, LaunchOutcome::Headless);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tui_without_hook_is_structured_missing_hook() {
+        let dir = config_dir("nohook");
+        write(&dir.join("agent.toml"), agent_toml());
+        write(&dir.join("llm.toml"), llm_toml());
+        let rt = bootstrap(&dir).unwrap();
+        let err = launch(&rt, LaunchMode::Tui, None, None).unwrap_err();
+        assert!(matches!(err, RuntimeError::MissingHook { mode: "tui" }));
+        let err = launch(&rt, LaunchMode::Serve, None, None).unwrap_err();
+        assert!(matches!(err, RuntimeError::MissingHook { mode: "serve" }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn public_gate_still_refuses_without_pairing() {
+        assert!(check_public_gate(true, false).is_err());
+        assert!(check_public_gate(false, false).is_ok());
+    }
+
+    #[test]
+    fn resume_transcript_rejects_invalid_middle_line() {
+        let dir = config_dir("resume-invalid");
+        let path = dir.join("s1.jsonl");
+        std::fs::write(
+            &path,
+            "{\"role\":\"user\",\"text\":\"hi\"}\nnot-json\n{\"role\":\"assistant\",\"text\":\"ok\"}\n",
+        )
+        .unwrap();
+        let err = resume_transcript(&path).unwrap_err();
+        match err {
+            RuntimeError::ConfigParse { detail, .. } => assert!(detail.contains("line 2")),
+            other => panic!("expected ConfigParse, got {other:?}"),
+        }
+        // Trailing truncated line is tolerated.
+        std::fs::write(
+            &path,
+            "{\"role\":\"user\",\"text\":\"hi\"}\n{\"role\":\"assistant\",\"text\":\"ok\"}\n{\"role\":\"ass",
+        )
+        .unwrap();
+        let (id, lines) = resume_transcript(&path).unwrap();
+        assert_eq!(id, "s1");
+        assert_eq!(lines.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = PathBuf::new();
     }
 }

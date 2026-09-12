@@ -183,11 +183,13 @@ pub fn has_plan_directive(text: &str) -> bool {
 }
 
 /// Loop error/result types (ARCHITECTURE.md §7).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum LoopError {
     /// Reached the configured max step budget.
+    #[error("max steps exceeded ({executed_steps} executed steps)")]
     MaxStepsExceeded { executed_steps: u32 },
     /// Repeated the same observation past the duplicate threshold.
+    #[error("duplicate observation {duplicated_times} times (stuck detection)")]
     DuplicateObservation { duplicated_times: u32 },
 }
 
