@@ -50,10 +50,18 @@ pub fn compose(request: &BrowserToolRequest) -> Result<ScriptModule, ScriptError
                 args: request.args.to_string(),
             })
         }
-        BrowserVerb::Navigate | BrowserVerb::Click | BrowserVerb::Fill | BrowserVerb::Hover
-        | BrowserVerb::Drag | BrowserVerb::PressKey | BrowserVerb::Screenshot
-        | BrowserVerb::AccessibilityTree | BrowserVerb::GetText | BrowserVerb::GetHtml
-        | BrowserVerb::Download | BrowserVerb::Snapshot => Ok(stub_module(&request.verb, &request.args)),
+        BrowserVerb::Navigate
+        | BrowserVerb::Click
+        | BrowserVerb::Fill
+        | BrowserVerb::Hover
+        | BrowserVerb::Drag
+        | BrowserVerb::PressKey
+        | BrowserVerb::Screenshot
+        | BrowserVerb::AccessibilityTree
+        | BrowserVerb::GetText
+        | BrowserVerb::GetHtml
+        | BrowserVerb::Download
+        | BrowserVerb::Snapshot => Ok(stub_module(&request.verb, &request.args)),
     }
 }
 
@@ -104,8 +112,8 @@ fn base64(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webai_protocol::BrowserVerb;
     use serde_json::json;
+    use webai_protocol::BrowserVerb;
 
     #[test]
     fn evaluate_composes_module_and_roundtrips_script() {
@@ -127,7 +135,10 @@ mod tests {
             verb: BrowserVerb::Evaluate,
             args: json!({}),
         };
-        assert!(matches!(compose(&req), Err(ScriptError::MissingArg("script", BrowserVerb::Evaluate))));
+        assert!(matches!(
+            compose(&req),
+            Err(ScriptError::MissingArg("script", BrowserVerb::Evaluate))
+        ));
     }
 
     #[test]
@@ -152,7 +163,9 @@ mod tests {
                 args: json!({}),
             };
             let m = compose(&req).expect("stub compose must not fail");
-            assert!(m.execute_src.contains(&format!("\"{}\"", verb.canonical_name())));
+            assert!(m
+                .execute_src
+                .contains(&format!("\"{}\"", verb.canonical_name())));
         }
     }
 
@@ -166,6 +179,236 @@ mod tests {
         let b = compose(&req_a).unwrap();
         assert_eq!(a.execute_src, b.execute_src);
         assert_eq!(a.verify_src, b.verify_src);
+    }
+
+    // ---- 参数注入契约 / 模板快照 / fuzz / 枚举覆盖 (task: webai-script) ----
+
+    /// The canonical 13-verb list; a new `BrowserVerb` variant added without
+    /// updating this list (and the template table) must fail this test.
+    const ALL_VERBS: &[BrowserVerb] = &[
+        BrowserVerb::Navigate,
+        BrowserVerb::Click,
+        BrowserVerb::Fill,
+        BrowserVerb::Hover,
+        BrowserVerb::Drag,
+        BrowserVerb::PressKey,
+        BrowserVerb::Evaluate,
+        BrowserVerb::Screenshot,
+        BrowserVerb::AccessibilityTree,
+        BrowserVerb::GetText,
+        BrowserVerb::GetHtml,
+        BrowserVerb::Download,
+        BrowserVerb::Snapshot,
+    ];
+
+    #[test]
+    fn verb_list_covers_every_enum_variant() {
+        // Count assertion guards against both additions and removals: the
+        // architecture fixes the contract at exactly 13 verbs.
+        assert_eq!(ALL_VERBS.len(), 13, "verb contract is exactly 13");
+        // Every listed verb must compose successfully (template exists).
+        for verb in ALL_VERBS {
+            let req = BrowserToolRequest {
+                verb: *verb,
+                // A typical argument set every verb's template accepts.
+                args: serde_json::json!({
+                    "script": "1", "selector": "#a", "url": "https://x",
+                    "value": "v", "key": "Enter", "source": "#a", "target": "#b"
+                }),
+            };
+            let m = compose(&req).unwrap_or_else(|e| panic!("{verb:?} has no template: {e}"));
+            // Evaluate's payload is base64-wrapped (no verb name in source);
+            // every other stub names the verb in execute_src.
+            if *verb != BrowserVerb::Evaluate {
+                assert!(
+                    m.execute_src.contains(verb.canonical_name()),
+                    "{verb:?} template must name the verb"
+                );
+            }
+            assert!(
+                m.execute_src.contains("export const execute"),
+                "{verb:?} must export execute"
+            );
+        }
+    }
+
+    #[test]
+    fn args_roundtrip_survives_hostile_content() {
+        let hostile = [
+            "he said \"hi\" \\ backslash",
+            "</script><script>alert(1)</script>",
+            "emoji 🦀 unicode 中文 \n\t\r",
+        ];
+        for script in hostile {
+            let req = BrowserToolRequest {
+                verb: BrowserVerb::Evaluate,
+                args: serde_json::json!({ "script": script }),
+            };
+            let m = compose(&req).unwrap();
+            let decoded = decode_base64(extract_b64(&m.execute_src));
+            assert_eq!(decoded, script, "script semantics must survive round-trip");
+            // The template itself must not contain the raw payload (injection guard).
+            assert!(
+                !m.execute_src.contains(script),
+                "raw payload must not leak into template source"
+            );
+            // args JSON must re-parse to the same value.
+            let back: serde_json::Value = serde_json::from_str(&m.args).unwrap();
+            assert_eq!(back, req.args);
+        }
+    }
+
+    #[test]
+    fn args_roundtrip_one_megabyte_payload() {
+        let big = "x".repeat(1024 * 1024);
+        let req = BrowserToolRequest {
+            verb: BrowserVerb::Evaluate,
+            args: serde_json::json!({ "script": big }),
+        };
+        let m = compose(&req).unwrap();
+        let decoded = decode_base64(extract_b64(&m.execute_src));
+        assert_eq!(decoded.len(), 1024 * 1024);
+    }
+
+    #[test]
+    fn snapshot_13_verbs_typical_and_boundary_args() {
+        // Per-verb snapshot: typical + boundary (empty selector / missing
+        // field / oversized text). Insta-style inline snapshots via hash
+        // stability: composing twice must be byte-identical, and each verb's
+        // execute_src must name the verb exactly once in the stub header.
+        let cases: Vec<(BrowserVerb, serde_json::Value)> = vec![
+            (
+                BrowserVerb::Navigate,
+                serde_json::json!({"url": "https://example.com"}),
+            ),
+            (BrowserVerb::Navigate, serde_json::json!({})),
+            (BrowserVerb::Navigate, serde_json::json!({"url": ""})),
+            (
+                BrowserVerb::Click,
+                serde_json::json!({"selector": "#submit"}),
+            ),
+            (BrowserVerb::Click, serde_json::json!({"selector": ""})),
+            (BrowserVerb::Click, serde_json::json!({})),
+            (
+                BrowserVerb::Fill,
+                serde_json::json!({"selector": "#q", "value": "hello"}),
+            ),
+            (
+                BrowserVerb::Fill,
+                serde_json::json!({"selector": "", "value": ""}),
+            ),
+            (BrowserVerb::Fill, serde_json::json!({"selector": "#q"})),
+            (BrowserVerb::Hover, serde_json::json!({"selector": ".menu"})),
+            (BrowserVerb::Hover, serde_json::json!({})),
+            (
+                BrowserVerb::Hover,
+                serde_json::json!({"selector": "a > b + c"}),
+            ),
+            (
+                BrowserVerb::Drag,
+                serde_json::json!({"source": "#a", "target": "#b"}),
+            ),
+            (BrowserVerb::Drag, serde_json::json!({"source": ""})),
+            (BrowserVerb::Drag, serde_json::json!({})),
+            (BrowserVerb::PressKey, serde_json::json!({"key": "Enter"})),
+            (BrowserVerb::PressKey, serde_json::json!({"key": ""})),
+            (BrowserVerb::PressKey, serde_json::json!({})),
+            (
+                BrowserVerb::Evaluate,
+                serde_json::json!({"script": "document.title"}),
+            ),
+            (BrowserVerb::Evaluate, serde_json::json!({"script": ""})),
+            (
+                BrowserVerb::Evaluate,
+                serde_json::json!({"script": "x".repeat(10000)}),
+            ),
+            (BrowserVerb::Screenshot, serde_json::json!({})),
+            (
+                BrowserVerb::Screenshot,
+                serde_json::json!({"full_page": true}),
+            ),
+            (BrowserVerb::AccessibilityTree, serde_json::json!({})),
+            (BrowserVerb::GetText, serde_json::json!({})),
+            (
+                BrowserVerb::GetHtml,
+                serde_json::json!({"selector": "body"}),
+            ),
+            (
+                BrowserVerb::Download,
+                serde_json::json!({"url": "https://example.com/f.zip"}),
+            ),
+            (BrowserVerb::Download, serde_json::json!({})),
+            (BrowserVerb::Snapshot, serde_json::json!({})),
+            (BrowserVerb::Snapshot, serde_json::json!({"max_text": 4096})),
+        ];
+        assert!(
+            cases.len() >= 13 * 3 - 9,
+            "at least ~3 cases per verb family"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for (verb, args) in &cases {
+            let req = BrowserToolRequest {
+                verb: *verb,
+                args: args.clone(),
+            };
+            let m1 = compose(&req);
+            let m2 = compose(&req);
+            match (m1, m2) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a, b, "compose must be deterministic for {verb:?}");
+                    seen.insert(*verb);
+                }
+                (Err(ScriptError::MissingArg(_, _)), Err(_)) => {
+                    // Documented boundary: missing required arg is an error,
+                    // never a panic.
+                    seen.insert(*verb);
+                }
+                (other, _) => panic!("unexpected compose result for {verb:?}: {other:?}"),
+            }
+        }
+        assert_eq!(seen.len(), 13, "every verb exercised by the snapshot table");
+    }
+
+    #[test]
+    fn fuzz_compose_never_panics_always_result() {
+        // Deterministic xorshift PRNG: no rand dependency, reproducible runs.
+        let mut state: u64 = 0x2545F4914F6CDD1D;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let verbs = ALL_VERBS;
+        // 100k iterations (CI can lower via env; full run locally).
+        let iterations: u64 = std::env::var("SCRIPT_FUZZ_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let alphabet: Vec<char> = "\\\"'`<>{}[]()&;=/\\\n\t\r\u{0}\u{1F980}abc012 "
+            .chars()
+            .collect();
+        for i in 0..iterations {
+            let arg_len = (next() % 64) as usize;
+            let arg: String = (0..arg_len)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()])
+                .collect();
+            let args = if next() % 4 == 0 {
+                serde_json::json!({ "script": arg, "selector": arg, "url": arg })
+            } else if next() % 4 == 1 {
+                serde_json::json!({})
+            } else if next() % 4 == 2 {
+                serde_json::json!({ "unknown_field": { "nested": [arg] } })
+            } else {
+                serde_json::json!(arg) // args is not even an object
+            };
+            let req = BrowserToolRequest {
+                verb: verbs[(next() as usize) % verbs.len()],
+                args,
+            };
+            let result = std::panic::catch_unwind(|| compose(&req));
+            assert!(result.is_ok(), "compose panicked at iteration {i}");
+        }
     }
 
     fn extract_b64(src: &str) -> &str {

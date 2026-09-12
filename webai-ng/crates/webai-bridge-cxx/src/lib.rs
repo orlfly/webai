@@ -61,10 +61,7 @@ impl WebkitBridgeCxx {
     /// Compile a browser request into a two-phase script module (this is a
     /// pure helper; actual script composing lives in `webai-script`). In stub
     /// mode we surface CogLaunch until the real bridge is wired.
-    pub fn preflight_browser_request(
-        &self,
-        verb: BrowserVerb,
-    ) -> Result<(), BridgeCxxError> {
+    pub fn preflight_browser_request(&self, verb: BrowserVerb) -> Result<(), BridgeCxxError> {
         if !self.launched {
             return Err(BridgeCxxError::CogLaunch(format!(
                 "preflight_browser_request({verb:?}) requires a launched coy view"
