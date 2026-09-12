@@ -2185,6 +2185,7 @@ dependencies = [
  "tokio",
  "tracing",
  "webai-bridge",
+ "webai-config",
  "webai-llm",
  "webai-memory",
  "webai-protocol",
