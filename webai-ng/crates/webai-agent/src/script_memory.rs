@@ -187,6 +187,22 @@ impl RepairError {
 mod tests {
     use super::*;
 
+    // Isolated in-memory store per test: the dual-channel store persists to
+    // a shared `.webai/vec` index, so without a unique path a prior test's
+    // write would be reopened by a later test's fresh store (78 merge).
+    fn temp_store(name: &str) -> SharedMemoryStore {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("webai-ag-mem-{name}-{pid}-{nanos}"));
+        SharedMemoryStore::from_config(webai_memory::MemoryConfig {
+            index_path: path,
+            ..Default::default()
+        })
+    }
+
     fn entry(verb: &str, task: &str, script: &str) -> ScriptMemoryEntry {
         ScriptMemoryEntry {
             task: task.into(),
@@ -200,7 +216,7 @@ mod tests {
 
     #[test]
     fn reuse_hits_same_verb_and_marks_reused() {
-        let store = SharedMemoryStore::new();
+        let store = temp_store("reuse_hits");
         store
             .write_script(entry("click", "submit login", "window.c('x')"))
             .unwrap();
@@ -212,7 +228,7 @@ mod tests {
 
     #[test]
     fn reuse_ignored_when_disabled() {
-        let store = SharedMemoryStore::new();
+        let store = temp_store("reuse_ignored");
         store
             .write_script(entry("click", "submit login", "x"))
             .unwrap();
@@ -223,7 +239,7 @@ mod tests {
 
     #[test]
     fn remember_is_noop_when_disabled() {
-        let store = SharedMemoryStore::new();
+        let store = temp_store("remember_noop");
         let mem = ScriptMemory::new(store.clone(), false);
         mem.remember(entry("click", "t", "s")).unwrap();
         assert_eq!(store.len(), 0, "no memory write when disabled");
@@ -231,7 +247,7 @@ mod tests {
 
     #[test]
     fn remember_fixed_keeps_id_and_updates_script() {
-        let store = SharedMemoryStore::new();
+        let store = temp_store("remember_fixed");
         store.write_script(entry("click", "t", "old")).unwrap();
         let mem = ScriptMemory::new(store.clone(), true);
         let prev = store.recall_scripts("t", 1).remove(0);
@@ -243,7 +259,7 @@ mod tests {
 
     #[test]
     fn repair_context_has_all_fixed_sections() {
-        let store = SharedMemoryStore::new();
+        let store = temp_store("repair_context");
         let mem = ScriptMemory::new(store, true);
         let prompt = mem.repair_prompt(
             "window.bad()",

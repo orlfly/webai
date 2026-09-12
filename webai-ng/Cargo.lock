@@ -2270,6 +2270,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "webai-embedding",
  "webai-protocol",
