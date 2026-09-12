@@ -38,11 +38,13 @@ impl ImageProtocol {
     }
 }
 
-/// Probe the terminal for graphics support (Kitty → iTerm2 → Sixel order).
+/// Probe the terminal for graphics support (Kitty → iTerm2 order; Sixel is
+/// deliberately NOT detected: without a PNG→palette sixel pixel converter we
+/// cannot render honest pixels, so sixel-only terminals degrade to the
+/// placeholder path instead of drawing fake stripes — 评审 #81 Major-1).
 ///
 /// Detection uses the documented env markers: `KITTY_WINDOW_ID` (Kitty),
-/// `TERM_PROGRAM=iTerm.app` / `WezTerm` (iTerm2 protocol), `TERM` containing
-/// `sixel`/`mlterm`/`xterm` with sixtle… Sixel fallback checks `TERM` suffixes.
+/// `TERM_PROGRAM=iTerm.app` / `WezTerm` (iTerm2 protocol).
 pub fn detect_protocol() -> Option<ImageProtocol> {
     if std::env::var_os("KITTY_WINDOW_ID").is_some() || std::env::var_os("KITTY_PID").is_some() {
         return Some(ImageProtocol::Kitty);
@@ -52,12 +54,7 @@ pub fn detect_protocol() -> Option<ImageProtocol> {
             return Some(ImageProtocol::ITerm2);
         }
     }
-    if let Ok(term) = std::env::var("TERM") {
-        let lower = term.to_lowercase();
-        if lower.contains("sixel") || lower.contains("mlterm") {
-            return Some(ImageProtocol::Sixel);
-        }
-    }
+    // Sixel terminals intentionally fall through to None (placeholder).
     None
 }
 
@@ -66,8 +63,10 @@ pub fn detect_protocol() -> Option<ImageProtocol> {
 pub enum PlaceholderReason {
     /// Terminal advertises no graphics protocol.
     NoProtocolSupport,
-    /// The image data failed to decode/persist.
+    /// The image data failed to decode.
     DecodeFailure(String),
+    /// The temp file could not be persisted (e.g. read-only directory).
+    PersistFailure(String),
 }
 
 impl PlaceholderReason {
@@ -77,6 +76,9 @@ impl PlaceholderReason {
                 "[image] terminal does not support Kitty/iTerm2/Sixel graphics"
             }
             PlaceholderReason::DecodeFailure(_) => "[image] decode failed; showing placeholder",
+            PlaceholderReason::PersistFailure(_) => {
+                "[image] could not persist to temp dir; showing placeholder"
+            }
         }
     }
 }
@@ -165,8 +167,9 @@ impl ImagePipeline {
         let height = u32::from_be_bytes([raw[20], raw[21], raw[22], raw[23]]);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let temp_path = self.temp_dir.join(format!("webai-img-{id}.png"));
-        fs::write(&temp_path, &raw)
-            .map_err(|_| PlaceholderReason::DecodeFailure("base64 decode failed".into()))?;
+        fs::write(&temp_path, &raw).map_err(|e| {
+            PlaceholderReason::PersistFailure(format!("{}: {e}", temp_path.display()))
+        })?;
         let img = IngestedImage {
             id,
             temp_path,
