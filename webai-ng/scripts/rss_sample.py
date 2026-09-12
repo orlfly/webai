@@ -69,12 +69,16 @@ def main():
 
     server = serve_dir(page_dir, STATIC_PORT)
 
-    # Launch webai headless against the fixture URL. LLM is NOT started
-    # (measurement口径 explicitly excludes the LLM process).
+    # Launch webai headless against the fixture URL, keeping it resident for
+    # the whole sampling window (--resident-secs >= samples*interval, so the
+    # process does NOT exit before the last read — 评审 #88 Blocker /
+    # #71 Major-3). LLM is NOT started (measurement explicitly excludes it).
     env = dict(os.environ, WEBAI_LLM_DISABLED="1")
+    resident_secs = int(max(args.samples * args.interval, 10))
     proc = subprocess.Popen(
         [args.webai_bin, "--headless", "--prompt",
-         f"navigate url=http://127.0.0.1:{STATIC_PORT}/{page_name}"],
+         f"navigate url=http://127.0.0.1:{STATIC_PORT}/{page_name}",
+         "--resident-secs", str(resident_secs)],
         cwd=root, env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
