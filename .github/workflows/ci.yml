@@ -73,3 +73,45 @@ jobs:
           manifest-path: webai-ng/Cargo.toml
           arguments: --no-default-features
           command-arguments: bans licenses sources
+
+  # Opt-in C++/WebKit path (task 33): must build and test with the
+  # `legacy_cpp` feature in a WPE-capable environment. Independent of the
+  # default job so one failing path never blocks the other.
+  legacy_cpp:
+    name: legacy_cpp (WPE real-device path)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm-slim
+    defaults:
+      run:
+        working-directory: ${{ env.WORKSPACE }}
+    steps:
+      - name: Install toolchain + WPE dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl build-essential pkg-config libclang-dev clang \
+            libwpe-1.0-1 libwpebackend-fdo-1.0-1 libwpewebkit-1.0-1
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.WORKSPACE }}
+
+      - name: Build with --features legacy_cpp
+        run: cargo build -p webai-bridge-cxx --features legacy_cpp
+
+      - name: Unit tests with --features legacy_cpp
+        run: cargo test -p webai-bridge-cxx --features legacy_cpp
+
+      # Real-device smoke: feature-gated + #[ignore]d integration test that
+      # launches the cog view and prefights one browser verb. Only meaningful
+      # inside a WPE-capable image, hence --ignored here.
+      - name: Real-device smoke (launch + preflight)
+        run: cargo test -p webai-bridge-cxx --features legacy_cpp --test legacy_cpp_smoke -- --ignored --nocapture

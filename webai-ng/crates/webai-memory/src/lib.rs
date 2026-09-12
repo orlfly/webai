@@ -52,7 +52,8 @@ pub struct JsonlSessionRecorder {
 
 impl JsonlSessionRecorder {
     pub fn new_for_dir(collab_dir: &Path, session_id: &str) -> Result<Self, MemoryError> {
-        std::fs::create_dir_all(collab_dir).map_err(|e| MemoryError::BackendUnavailable(e.to_string()))?;
+        std::fs::create_dir_all(collab_dir)
+            .map_err(|e| MemoryError::BackendUnavailable(e.to_string()))?;
         Ok(Self {
             path: collab_dir.join(format!("{session_id}.jsonl")),
             lines: Arc::new(RwLock::new(Vec::new())),
@@ -65,15 +66,26 @@ impl JsonlSessionRecorder {
 
     /// Append a single JSON-line and flush.
     pub fn record(&self, line: serde_json::Value) -> Result<(), MemoryError> {
-        let mut lines = self.lines.write().map_err(|_| MemoryError::BackendUnavailable("lock poisoned".into()))?;
+        let mut lines = self
+            .lines
+            .write()
+            .map_err(|_| MemoryError::BackendUnavailable("lock poisoned".into()))?;
         lines.push(line.to_string());
         Ok(())
     }
 
     /// Scan a session file, skipping a trailing truncated (invalid JSON) line.
     pub fn recovery_scan(&self) -> Vec<String> {
-        let lines = self.lines.read().map_err(|_| ()).map(|g| g.clone()).unwrap_or_default();
-        lines.into_iter().filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()).collect()
+        let lines = self
+            .lines
+            .read()
+            .map_err(|_| ())
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        lines
+            .into_iter()
+            .filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
+            .collect()
     }
 }
 
@@ -107,14 +119,22 @@ impl SharedMemoryStore {
             return Err(MemoryError::BackendUnavailable("memory disabled".into()));
         }
         entry.tags.insert(0, format!("script:{}", entry.verb));
-        let mut m = self.scripts.write().map_err(|_| MemoryError::BackendUnavailable("lock poisoned".into()))?;
+        let mut m = self
+            .scripts
+            .write()
+            .map_err(|_| MemoryError::BackendUnavailable("lock poisoned".into()))?;
         m.insert(entry.id.clone(), entry);
         Ok(())
     }
 
     /// Recall up to `limit` script entries matching `task` (best-effort).
     pub fn recall_scripts(&self, task: &str, limit: usize) -> Vec<ScriptMemoryEntry> {
-        let m = self.scripts.read().map_err(|_| ()).map(|g| g.clone()).unwrap_or_default();
+        let m = self
+            .scripts
+            .read()
+            .map_err(|_| ())
+            .map(|g| g.clone())
+            .unwrap_or_default();
         m.values()
             .filter(|e| e.task.contains(task))
             .take(limit)
@@ -155,11 +175,19 @@ mod tests {
     #[test]
     fn write_and_recall_script_entries() {
         let store = SharedMemoryStore::new();
-        store.write_script(sample_entry("click", "submit login form")).unwrap();
-        store.write_script(sample_entry("fill", "submit login form")).unwrap();
+        store
+            .write_script(sample_entry("click", "submit login form"))
+            .unwrap();
+        store
+            .write_script(sample_entry("fill", "submit login form"))
+            .unwrap();
         let hits = store.recall_scripts("login form", 10);
         assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|e| e.tags.first().map(|t| t.starts_with("script:")).unwrap_or(false)));
+        assert!(hits.iter().all(|e| e
+            .tags
+            .first()
+            .map(|t| t.starts_with("script:"))
+            .unwrap_or(false)));
         assert_eq!(store.len(), 2);
     }
 
@@ -182,10 +210,7 @@ mod tests {
 
     #[test]
     fn jsonl_recorder_drops_trailing_truncated_line() {
-        let dir = std::env::temp_dir().join(format!(
-            "webai-ng-mem-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("webai-ng-mem-test-{}", std::process::id()));
         let rec = JsonlSessionRecorder::new_for_dir(&dir, "s1").unwrap();
         rec.record(serde_json::json!({"ok": true})).unwrap();
         rec.record(serde_json::json!({"ok": false})).unwrap();

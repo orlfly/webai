@@ -74,9 +74,13 @@ impl BgeM3Adapter {
     /// Produce a deterministic placeholder vector hashing the input text length.
     fn placeholder(&self, text: &str) -> Embedding {
         let mut values = vec![0.0f32; self.dim];
-        let seed = text.as_bytes().iter().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(*b as u64));
+        let seed = text
+            .as_bytes()
+            .iter()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(*b as u64));
         for (i, v) in values.iter_mut().enumerate() {
-            *v = ((seed ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15)).wrapping_rem(1000) as f32) / 1000.0;
+            *v = ((seed ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15)).wrapping_rem(1000) as f32)
+                / 1000.0;
         }
         Embedding {
             dim: self.dim,
@@ -94,7 +98,10 @@ mod tests {
         let m = BgeM3Adapter::new(1024);
         let a = m.embed("hello world").await.unwrap();
         let b = m.embed("hello world").await.unwrap();
-        assert_eq!(a, b, "same input must deterministically embed to the same vector");
+        assert_eq!(
+            a, b,
+            "same input must deterministically embed to the same vector"
+        );
         assert_eq!(a.dim, 1024);
         assert_eq!(b.dim, 1024);
         assert_eq!(m.dimensions(), 1024);
