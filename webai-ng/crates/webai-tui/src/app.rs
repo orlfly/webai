@@ -99,10 +99,28 @@ impl App {
         self.dirty = true;
     }
 
-    /// Scroll down (older content) by one row.
+    /// Consume one frontend `UiEvent` (task #80 / #58 integration): a
+    /// streaming delta appends to the last assistant line; a Finished event
+    /// updates the status bar.
+    pub fn on_ui_event(&mut self, ev: &crate::UiEvent) {
+        match ev {
+            crate::UiEvent::Delta(text) => self.push_stream_delta(text),
+            crate::UiEvent::Finished(msg) => self.set_status(msg),
+        }
+    }
+
+    /// Scroll down (older content) by one row. The offset is clamped to the
+    /// content length so Up x1000 cannot scroll past the oldest line
+    /// (task #80).
     pub fn scroll_up(&mut self) {
-        self.scroll = self.scroll.saturating_add(1);
+        self.scroll = (self.scroll + 1).min(self.max_scroll());
         self.dirty = true;
+    }
+
+    /// Upper bound for the scroll offset: the number of transcript lines
+    /// (each contributes at least one rendered row).
+    fn max_scroll(&self) -> usize {
+        self.lines.len()
     }
 
     /// Scroll back down toward the newest line.
@@ -111,9 +129,9 @@ impl App {
         self.dirty = true;
     }
 
-    /// Page up/down.
+    /// Page up/down (clamped to the content length, task #80).
     pub fn page_up(&mut self) {
-        self.scroll = self.scroll.saturating_add(PAGE_ROWS as usize);
+        self.scroll = (self.scroll + PAGE_ROWS as usize).min(self.max_scroll());
         self.dirty = true;
     }
 
@@ -128,10 +146,12 @@ impl App {
         match (key.code, key.modifiers) {
             (crossterm::event::KeyCode::Char('c'), KeyModifiers::CONTROL) => KeyAction::Exit,
             (crossterm::event::KeyCode::Enter, _) => {
-                let text = std::mem::take(&mut self.input);
-                if text.trim().is_empty() {
+                // A blank / whitespace-only Enter keeps the draft (review #59):
+                // it is an accidental keypress, not a submission intent.
+                if self.input.trim().is_empty() {
                     KeyAction::Internal
                 } else {
+                    let text = std::mem::take(&mut self.input);
                     self.push_user(&text);
                     KeyAction::Send(text)
                 }

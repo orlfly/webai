@@ -4,11 +4,13 @@
 //! (`session`, ARCHITECTURE.md §4.11): it holds an `Arc<AgentSession>` and
 //! streams `SessionEvent`s out over a bounded mpsc channel. The frontend never
 //! imports the bridge/webkit layers directly (§2 boundary 1). `app` renders
-//! the streaming transcript with the §4.11 keymap; `images` adds the terminal
-//! image pipeline (decode-once, viewport dispatch, cleanup).
+//! the streaming transcript with the §4.11 keymap; `run` drives the event
+//! loop with terminal lifecycle guard; `images` adds the terminal image
+//! pipeline.
 
 pub mod app;
 pub mod images;
+pub mod run;
 pub mod session;
 
 pub use app::{App, ChatLine, KeyAction, PAGE_ROWS, RENDER_TICK_MS};
@@ -16,6 +18,7 @@ pub use images::{
     detect_protocol, DispatchOutcome, ImagePipeline, ImageProtocol, IngestedImage,
     PlaceholderReason,
 };
+pub use run::{install_panic_hook, run, run_real, LoopSignal, TerminalGuard};
 pub use session::{PromptHandler, SessionBackend, COALESCE_STEP_BURST, EVENT_CHANNEL_CAPACITY};
 
 /// A command the frontend sends to the session background task.
@@ -25,6 +28,16 @@ pub enum UiCommand {
     Send { text: String },
     /// Ask the background task to stop cleanly.
     Shutdown,
+}
+
+/// An event streamed from the session backend to the frontend: either a
+/// streaming text delta (rendered incrementally) or a status change.
+#[derive(Debug, Clone)]
+pub enum UiEvent {
+    /// Streaming text delta appended to the transcript.
+    Delta(String),
+    /// The loop finished with a terminal state message.
+    Finished(String),
 }
 
 /// Build a terminal session state for a completion result (used by the
