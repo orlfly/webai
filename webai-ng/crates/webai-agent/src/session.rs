@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use webai_memory::{JsonlSessionRecorder, MemoryError, SharedMemoryStore};
+use webai_memory::session_log::JsonlSessionLog;
+use webai_memory::{MemoryError, SharedMemoryStore};
 
 use crate::AgentLoop;
 use crate::ChatMessage;
@@ -115,7 +116,7 @@ pub struct AgentSession {
     state: Mutex<SessionState>,
     loop_: Arc<AgentLoop>,
     memory: Arc<SharedMemoryStore>,
-    recorder: Option<JsonlSessionRecorder>,
+    recorder: Option<Mutex<JsonlSessionLog>>,
 }
 
 /// Manual `Debug` impl because `AgentLoop` contains a `dyn Tool` which is not
@@ -160,10 +161,10 @@ impl AgentSession {
     ) -> Result<Self, MemoryError> {
         let id = session_id.into();
         let recorder = if options.enable_jsonl {
-            Some(JsonlSessionRecorder::new_for_dir(
-                &options.sessions_dir,
-                &id,
-            )?)
+            Some(Mutex::new(
+                JsonlSessionLog::open(&options.sessions_dir, &id)
+                    .map_err(|e| MemoryError::BackendUnavailable(e.to_string()))?,
+            ))
         } else {
             None
         };
@@ -186,7 +187,7 @@ impl AgentSession {
     }
 
     /// The JSONL recorder handle (session log, owned by webai-memory).
-    pub fn recorder(&self) -> Option<&JsonlSessionRecorder> {
+    pub fn recorder(&self) -> Option<&Mutex<JsonlSessionLog>> {
         self.recorder.as_ref()
     }
 
@@ -203,7 +204,57 @@ impl AgentSession {
             "state": self.state().as_str(),
             "transcript": transcript.iter().map(chat_message_to_json).collect::<Vec<_>>(),
         });
-        recorder.record(payload)
+        recorder
+            .lock()
+            .unwrap()
+            .record(&payload)
+            .map_err(|e| MemoryError::BackendUnavailable(e.to_string()))
+    }
+
+    /// Recover a session from a persisted JSONL log (FR-5 / M-3): read every
+    /// complete record from `<sessions_dir>/<id>.jsonl`, rebuild the
+    /// transcript, and return the session already in the `Resumed` state so
+    /// the loop can continue where it left off (task #79).
+    pub fn recover(
+        sessions_dir: &std::path::Path,
+        session_id: &str,
+        loop_: Arc<AgentLoop>,
+        memory: Arc<SharedMemoryStore>,
+    ) -> Result<Self, MemoryError> {
+        let path = sessions_dir.join(format!("{session_id}.jsonl"));
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            MemoryError::BackendUnavailable(format!("cannot read {}: {e}", path.display()))
+        })?;
+        let mut transcript = Vec::new();
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(value) => {
+                    if let Some(entries) = value.get("transcript").and_then(|v| v.as_array()) {
+                        for e in entries {
+                            if let Some(msg) = chat_message_from_json(e) {
+                                transcript.push(msg);
+                            }
+                        }
+                    } else if let Some(msg) = chat_message_from_json(&value) {
+                        transcript.push(msg);
+                    }
+                }
+                Err(_) => continue, // truncated / malformed line: skip (M-3)
+            }
+        }
+        let session = Self::new(session_id, loop_, memory);
+        session
+            .resume()
+            .map_err(|e| MemoryError::BackendUnavailable(e.to_string()))?;
+        {
+            let mut tr = session.transcript.lock().unwrap();
+            *tr = transcript;
+        }
+        Ok(session)
     }
 
     // -- state machine transitions --------------------------------------------
@@ -242,6 +293,13 @@ impl AgentSession {
                 *state,
                 SessionState::Resumed,
                 "a closed session cannot be resumed",
+            ));
+        }
+        if matches!(*state, SessionState::Resumed) {
+            return Err(SessionTransitionError::new(
+                *state,
+                SessionState::Resumed,
+                "a running session cannot resume from a snapshot; pause it first",
             ));
         }
         let mut tr = self.transcript.lock().unwrap();
@@ -300,6 +358,35 @@ impl AgentSession {
 
     pub fn memory(&self) -> &Arc<SharedMemoryStore> {
         &self.memory
+    }
+}
+
+/// Inverse of [`chat_message_to_json`] for a single turn: accepts either the
+/// snapshot form `{"role": ..., "text": ...}` or the session-log forms
+/// `{"kind": "user_prompt", "text": ...}` / `{"kind": "step", "step": {...}}`.
+fn chat_message_from_json(value: &serde_json::Value) -> Option<ChatMessage> {
+    if let (Some(role), Some(text)) = (
+        value.get("role").and_then(|v| v.as_str()),
+        value.get("text").and_then(|v| v.as_str()),
+    ) {
+        return match role {
+            "user" => Some(ChatMessage::User(text.to_owned())),
+            "assistant" => Some(ChatMessage::Assistant(text.to_owned())),
+            _ => None,
+        };
+    }
+    match value.get("kind").and_then(|v| v.as_str())? {
+        "user_prompt" => Some(ChatMessage::User(value.get("text")?.as_str()?.to_owned())),
+        "step" => {
+            let step = value.get("step")?;
+            Some(ChatMessage::Assistant(
+                step.get("observation")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+            ))
+        }
+        _ => None,
     }
 }
 
