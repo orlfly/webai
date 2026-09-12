@@ -2,3 +2,5 @@ AGENTS.md
 .jcode/
 .env
 /webai-ng/target/
+__pycache__/
+*.pyc

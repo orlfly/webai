@@ -23,6 +23,10 @@ fn main() {
     let mut config_dir: Option<PathBuf> = None;
     let mut resume: Option<PathBuf> = None;
     let mut prompt: Option<String> = None;
+    // Resident mode for RSS sampling (#70 Blocker-1): after the prompt
+    // completes, stay idle N seconds so the sampler can measure steady-state
+    // memory. 0 (default) = exit immediately.
+    let mut resident_secs: u64 = 0;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -32,6 +36,13 @@ fn main() {
             "--public" => public = true,
             "--prompt" => {
                 prompt = it.next().map(String::from);
+            }
+            "--resident-secs" => {
+                resident_secs = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| parse_err("--resident-secs expects a number"))
+                    .unwrap_or(0);
             }
             "--resume" => {
                 resume = it.next().map(PathBuf::from);
@@ -55,7 +66,7 @@ fn main() {
         }
     }
 
-    match run(mode, public, config_dir, resume, prompt) {
+    match run(mode, public, config_dir, resume, prompt, resident_secs) {
         Ok(()) => {}
         Err(e) => {
             // Structured, human-readable startup error (no bare "unknown error").
@@ -75,6 +86,7 @@ fn print_help() {
          --public         expose the server publicly (requires pairing)\n  \
          --config-dir <d> explicit config directory (default ~/.webai/config)\n  \
          --resume <file>  resume a persisted session transcript\n  \
+         --resident-secs <n> stay idle n seconds after the prompt (RSS sampling)\n  \
          -V, --version    print version\n  \
          -h, --help       this help",
         env!("CARGO_PKG_VERSION")
@@ -84,12 +96,17 @@ fn print_help() {
 /// All assembly delegated to the runtime module; the binary has no business
 /// logic beyond handing the frontend entry points to the runtime (thin-binary
 /// rule; layering `agent < {acp, tui} < bins/webai`).
+fn parse_err(msg: &str) -> RuntimeError {
+    RuntimeError::Io(format!("invalid argument: {msg}"))
+}
+
 fn run(
     mode: LaunchMode,
     public: bool,
     config_dir: Option<PathBuf>,
     resume: Option<PathBuf>,
     prompt: Option<String>,
+    resident_secs: u64,
 ) -> Result<(), RuntimeError> {
     // --public without pairing credentials is refused at startup.
     runtime::check_public_gate(public, std::env::var_os("WEBAI_PAIRING_KEY").is_some())?;
@@ -149,7 +166,13 @@ fn run(
     match outcome {
         LaunchOutcome::Tui => println!("webai: TUI mode finished"),
         LaunchOutcome::Serve => println!("webai: serve mode finished"),
-        LaunchOutcome::Headless => println!("webai: headless mode finished"),
+        LaunchOutcome::Headless => {
+            if resident_secs > 0 {
+                // Idle for the sampler: no work, just resident memory.
+                std::thread::sleep(std::time::Duration::from_secs(resident_secs));
+            }
+            println!("webai: headless mode finished");
+        }
     }
     Ok(())
 }
