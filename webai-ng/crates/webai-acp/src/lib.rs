@@ -14,6 +14,10 @@ pub use jsonrpc::{
 };
 pub use transport::{decode_frame, event_notify, handle_line, pump, TransportError};
 
+pub mod net;
+
+pub use net::{policy_disabled_by_language, Admission, NetworkPolicy, PolicyError, DEFAULT_BIND};
+
 /// Turn a user prompt into a `SessionEvent` sequence (alias for handler trait
 /// used by the dispatcher).
 pub use jsonrpc::AcpHandler;

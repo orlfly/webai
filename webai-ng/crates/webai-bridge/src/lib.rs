@@ -10,8 +10,10 @@ use webai_protocol::{BrowserToolRequest, BrowserToolResponse};
 use webai_script::{compose, ScriptError};
 use webai_webkit::{EvaluateResult, WebkitBridge, WebkitError};
 
+pub mod download_guard;
 pub mod perf;
 
+pub use download_guard::{sanitize_filename, FilenameError};
 pub use perf::{CacheKey, ComposeCache, ScreenshotDecision, ScreenshotThrottle};
 
 /// Structured error from the bridge layer.
