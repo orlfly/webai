@@ -81,7 +81,9 @@ jobs:
     name: legacy_cpp (WPE real-device path)
     runs-on: ubuntu-latest
     container:
-      image: debian:bookworm-slim
+      # Pinned reproducible image (tag convention + upgrade flow:
+      # webai-ng/docs/wpe-image.md). Never use `latest` here.
+      image: orlfly/webai-ng-ci:wpe-2.50-rust90
     defaults:
       run:
         working-directory: ${{ env.WORKSPACE }}
