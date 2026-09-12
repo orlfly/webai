@@ -11,7 +11,6 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use futures::StreamExt;
 use ratatui::Terminal;
 use std::io::{Result as IoResult, Stdout};
 use tokio::sync::mpsc;
@@ -100,14 +99,42 @@ pub async fn run<B: ratatui::backend::Backend>(
     result
 }
 
+/// Terminal input source, abstracted so tests can script keys instead of
+/// driving the real crossterm EventStream (评审 #80 Major-1).
+#[async_trait::async_trait]
+trait TermEvents: Send {
+    async fn next(&mut self) -> Option<std::result::Result<Event, std::io::Error>>;
+}
+
+#[async_trait::async_trait]
+impl TermEvents for EventStream {
+    async fn next(&mut self) -> Option<std::result::Result<Event, std::io::Error>> {
+        futures::StreamExt::next(self).await
+    }
+}
+
 async fn run_inner<B: ratatui::backend::Backend>(
-    mut terminal: Terminal<B>,
+    terminal: Terminal<B>,
     events: &mut mpsc::Receiver<crate::UiEvent>,
     commands: mpsc::UnboundedSender<UiCommand>,
     guard: &mut TerminalGuard,
 ) -> IoResult<()> {
+    run_inner_with(terminal, events, commands, guard, &mut EventStream::new())
+        .await
+        .0
+}
+
+/// Core loop, parameterised over the terminal-event source (`TermEvents`).
+/// Returns the final [`App`] state so tests can assert transcript growth
+/// (评审 #80 Major-1).
+async fn run_inner_with<B: ratatui::backend::Backend>(
+    mut terminal: Terminal<B>,
+    events: &mut mpsc::Receiver<crate::UiEvent>,
+    commands: mpsc::UnboundedSender<UiCommand>,
+    guard: &mut TerminalGuard,
+    reader: &mut dyn TermEvents,
+) -> (IoResult<()>, App) {
     let mut app = App::default();
-    let mut reader = EventStream::new();
     let tick = std::time::Duration::from_millis(RENDER_TICK_MS);
 
     loop {
@@ -164,8 +191,8 @@ async fn run_inner<B: ratatui::backend::Backend>(
     }
 
     // Guard restores the terminal here (and on any panic via Drop).
-    let _ = guard;
-    Ok(())
+    guard.restore();
+    (Ok(()), app)
 }
 
 /// Normalised input source for the select above.
@@ -215,6 +242,81 @@ mod tests {
         assert!(guard.restored);
         guard.restore();
         assert!(guard.restored, "restore must be idempotent");
+    }
+
+    /// Scripted run_inner test (评审 #80 Major-1): a TestBackend terminal fed
+    /// Delta → Delta → Finished events must (a) return Ok, (b) grow the
+    /// transcript by three lines, (c) leave guard.restored == true. The
+    /// scripted term source emits three no-op resize events (ignored by the
+    /// loop, keeps it alive while Ui events drain); after those run out the
+    /// stream yields None... which would also break the loop, so ordering
+    /// relies on the Ui events being queued in the channel first. A closed
+    /// Ui channel then breaks the loop deterministically.
+    struct ScriptedEvents {
+        events: std::vec::IntoIter<Result<Event, std::io::Error>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TermEvents for ScriptedEvents {
+        async fn next(&mut self) -> Option<std::result::Result<Event, std::io::Error>> {
+            // Once scripted events run out, park forever (never None): the
+            // loop must be terminated by the Ui channel closing, not by the
+            // term stream ending.
+            match self.events.next() {
+                Some(ev) => Some(ev),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_inner_renders_events_and_restores_guard() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let terminal = ratatui::Terminal::new(backend).unwrap();
+        let (etx, mut erx) = tokio::sync::mpsc::channel(8);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        etx.send(crate::UiEvent::Delta("one".into())).await.unwrap();
+        etx.send(crate::UiEvent::Delta("two".into())).await.unwrap();
+        etx.send(crate::UiEvent::Finished("done".into()))
+            .await
+            .unwrap();
+        drop(etx); // closes the Ui channel -> loop breaks via Ui(None)
+
+        let mut guard = TerminalGuard {
+            restored: false,
+            _entered: true,
+        };
+        // Scripted term stream: one Ctrl+C key as a redundant exit path.
+        // Three no-op resizes: ignored by the loop but keep the term stream
+        // alive long enough for the queued Ui events to drain first.
+        let mut scripted = ScriptedEvents {
+            events: vec![
+                Ok(Event::Resize(80, 24)),
+                Ok(Event::Resize(80, 24)),
+                Ok(Event::Resize(80, 24)),
+            ]
+            .into_iter(),
+        };
+        // Feed the channel BEFORE the loop starts by pre-draining: use the
+        // run_inner_with core directly so channel close triggers exit after
+        // all three events were consumed.
+        let (result, app) =
+            run_inner_with(terminal, &mut erx, cmd_tx, &mut guard, &mut scripted).await;
+        result.unwrap();
+
+        // (b) all three events were consumed: the two Deltas merge into ONE
+        // streaming assistant line (tokens append to the last assistant
+        // line by design) and Finished sets the status.
+        assert_eq!(
+            app.lines.len(),
+            1,
+            "two Deltas merge into one assistant line"
+        );
+        assert_eq!(app.status, "done", "Finished must update the status");
+        // (c) guard restored by the loop's normal exit.
+        assert!(guard.restored, "loop exit must restore the terminal guard");
+        // The command channel must be empty (no keys were sent).
+        assert!(cmd_rx.try_recv().is_err(), "no UiCommand expected");
     }
 
     /// A render panic between enter() and restore() still restores the

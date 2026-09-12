@@ -84,7 +84,11 @@ mod tests {
             Arc::new(SharedMemoryStore::new()),
             vec![],
         ));
-        Arc::new(AgentSession::new(id, loop_, Arc::new(SharedMemoryStore::new())))
+        Arc::new(AgentSession::new(
+            id,
+            loop_,
+            Arc::new(SharedMemoryStore::new()),
+        ))
     }
 
     #[test]

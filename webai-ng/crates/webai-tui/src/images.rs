@@ -424,7 +424,10 @@ mod tests {
         // Sixel terminals intentionally degrade to None (评审 #81 Major-1):
         // no real pixel converter => placeholder instead of fake stripes.
         std::env::set_var("TERM", "xterm-256color-sixel");
-        assert!(detect_protocol().is_none(), "sixel must degrade to placeholder");
+        assert!(
+            detect_protocol().is_none(),
+            "sixel must degrade to placeholder"
+        );
         std::env::remove_var("TERM");
     }
 

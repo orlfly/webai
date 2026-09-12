@@ -153,7 +153,10 @@ pub fn resolve_config_dir(env: Option<&str>) -> PathBuf {
     if let Some(p) = env.filter(|s| !s.is_empty()) {
         let pb = PathBuf::from(p);
         if pb.is_file() {
-            return pb.parent().map(|d| d.to_path_buf()).unwrap_or_else(default_dir);
+            return pb
+                .parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(default_dir);
         }
         return pb;
     }
@@ -209,7 +212,8 @@ pub fn load_from(config_dir: &Path) -> Result<LoadedConfig, ConfigError> {
 /// Read and parse a required file; missing or corrupt is a hard error.
 fn read_required<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> Result<T, ConfigError> {
     let path = dir.join(name);
-    let raw = std::fs::read_to_string(&path).map_err(|_| ConfigError::Missing(path.display().to_string()))?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|_| ConfigError::Missing(path.display().to_string()))?;
     toml::from_str(&raw).map_err(|e| ConfigError::Parse {
         path: path.clone(),
         detail: e.to_string(),
@@ -268,23 +272,43 @@ mod tests {
     #[test]
     fn load_normal_config_succeeds() {
         let dir = temp_dir();
-        write(&dir, AGENT_FILE, r#"
+        write(
+            &dir,
+            AGENT_FILE,
+            r#"
 llm = "deepseek-v4-flash"
 memory = "default"
 max_steps = 30
 duplicate_threshold = 2
 auto_plan_on_multi_step = true
 script_memory_enabled = true
-"#);
-        write(&dir, LLM_FILE, r#"
+"#,
+        );
+        write(
+            &dir,
+            LLM_FILE,
+            r#"
 [deepseek-v4-flash]
 model = "deepseek-v4-flash"
 base_url = "https://api.deepseek.com"
 endpoint = "/v1/chat/completions"
-"#);
-        write(&dir, EMBEDDING_FILE, "backend = \"bge-m3\"\nmodel = \"BAAI/bge-m3\"\ndim = 1024\n");
-        write(&dir, MEMORY_FILE, "backend = \"kuzu\"\nsession_dir = \"~/.webai/sessions\"\n");
-        write(&dir, VECTOR_FILE, "backend = \"hnsw\"\nindex_path = \"~/.webai/vec\"\n");
+"#,
+        );
+        write(
+            &dir,
+            EMBEDDING_FILE,
+            "backend = \"bge-m3\"\nmodel = \"BAAI/bge-m3\"\ndim = 1024\n",
+        );
+        write(
+            &dir,
+            MEMORY_FILE,
+            "backend = \"kuzu\"\nsession_dir = \"~/.webai/sessions\"\n",
+        );
+        write(
+            &dir,
+            VECTOR_FILE,
+            "backend = \"hnsw\"\nindex_path = \"~/.webai/vec\"\n",
+        );
 
         let cfg = load_from(&dir).unwrap();
         assert_eq!(cfg.agent.llm, "deepseek-v4-flash");
