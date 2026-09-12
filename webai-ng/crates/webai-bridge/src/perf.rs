@@ -63,11 +63,13 @@ fn canonical_args(args: &serde_json::Value) -> String {
 }
 
 /// Compose cache with hit/miss counters (M-2 measurement surface).
+/// Eviction is LRU by last-used stamp (monotonic counter, no wall clock).
 #[derive(Debug)]
 pub struct ComposeCache {
-    entries: Mutex<HashMap<CacheKey, ScriptModule>>,
+    entries: Mutex<HashMap<CacheKey, (ScriptModule, u64)>>,
     hits: AtomicU64,
     misses: AtomicU64,
+    stamp: AtomicU64,
     /// Upper bound on cached entries (long sessions cannot grow unbounded).
     capacity: usize,
 }
@@ -84,6 +86,7 @@ impl ComposeCache {
             entries: Mutex::new(HashMap::new()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            stamp: AtomicU64::new(0),
             capacity,
         }
     }
@@ -95,20 +98,29 @@ impl ComposeCache {
         req: &BrowserToolRequest,
     ) -> Result<ScriptModule, webai_script::ScriptError> {
         let key = CacheKey::from_request(req);
-        if let Some(hit) = self.entries.lock().unwrap().get(&key) {
-            self.hits.fetch_add(1, Ordering::SeqCst);
-            return Ok(hit.clone());
+        {
+            let mut entries = self.entries.lock().unwrap();
+            if let Some((module, stamp)) = entries.get_mut(&key) {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                *stamp = self.stamp.fetch_add(1, Ordering::SeqCst) + 1;
+                return Ok(module.clone());
+            }
         }
         let module = webai_script::compose(req)?;
         self.misses.fetch_add(1, Ordering::SeqCst);
         let mut entries = self.entries.lock().unwrap();
         if entries.len() >= self.capacity {
-            // Simple bound: drop an arbitrary entry (HashMap iteration order).
-            if let Some(k) = entries.keys().next().cloned() {
-                entries.remove(&k);
+            // LRU: evict the entry with the smallest last-used stamp.
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (_, stamp))| *stamp)
+                .map(|(k, _)| k.clone())
+            {
+                entries.remove(&oldest);
             }
         }
-        entries.insert(key, module.clone());
+        let stamp = self.stamp.fetch_add(1, Ordering::SeqCst) + 1;
+        entries.insert(key, (module.clone(), stamp));
         Ok(module)
     }
 
@@ -140,9 +152,25 @@ impl ComposeCache {
 pub enum ScreenshotDecision {
     /// Capture a full PNG this step.
     Capture,
-    /// Throttled: keep the previous screenshot as the step's record
+    /// Throttled by rate: keep the previous screenshot as the step's record
     /// (placeholder semantics, FR-2 preserved without a full PNG per step).
     Throttled,
+    /// Not eligible at all (read-only verb): no record of any kind.
+    NotEligible,
+}
+
+/// Monotonic clock abstraction so tests are deterministic (no real sleeps).
+pub trait Clock: Send + Sync + std::fmt::Debug {
+    fn now(&self) -> Instant;
+}
+
+#[derive(Debug)]
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 /// Screenshot throttle (ARCHITECTURE.md §6 timers/throttle).
@@ -152,25 +180,42 @@ pub struct ScreenshotThrottle {
     last_capture: Mutex<Option<Instant>>,
     captured: AtomicU64,
     throttled: AtomicU64,
+    clock: Box<dyn Clock>,
 }
 
 impl ScreenshotThrottle {
     /// Throttle to at most one capture per `min_interval`.
     pub fn new(min_interval: Duration) -> Self {
+        Self::with_clock(min_interval, Box::new(SystemClock))
+    }
+
+    /// Injected-clock constructor (deterministic tests, CI-safe).
+    pub fn with_clock(min_interval: Duration, clock: Box<dyn Clock>) -> Self {
         Self {
             min_interval,
             last_capture: Mutex::new(None),
             captured: AtomicU64::new(0),
             throttled: AtomicU64::new(0),
+            clock,
+        }
+    }
+
+    /// Bridge-side hook: whether a screenshot may be captured right now
+    /// (rate gate only; eligibility is decided by `decide`).
+    pub fn capture_allowed(&self) -> bool {
+        let last = self.last_capture.lock().unwrap();
+        match *last {
+            Some(t) => self.clock.now().duration_since(t) >= self.min_interval,
+            None => true,
         }
     }
 
     /// Decide for one step. Read-only verbs never capture (they never did —
     /// `wants_screenshot` gates on mutating verbs, unchanged).
     pub fn decide(&self, verb: &BrowserVerb, visible_in_viewport: bool) -> ScreenshotDecision {
-        // Read-only verbs: no capture, matching the bridge's existing gate.
+        // Read-only verbs: not eligible at all (single-source gate in lib.rs).
         if !wants_screenshot(verb) {
-            return ScreenshotDecision::Throttled;
+            return ScreenshotDecision::NotEligible;
         }
         // Off-screen steps never dispatch (M5 image pipeline contract).
         if !visible_in_viewport {
@@ -178,7 +223,7 @@ impl ScreenshotThrottle {
             return ScreenshotDecision::Throttled;
         }
         let mut last = self.last_capture.lock().unwrap();
-        let now = Instant::now();
+        let now = self.clock.now();
         match *last {
             Some(t) if now.duration_since(t) < self.min_interval => {
                 // High frequency: merge into the previous capture (FR-2 keeps
@@ -203,19 +248,7 @@ impl ScreenshotThrottle {
     }
 }
 
-/// Mirror of the bridge's `wants_screenshot` gate (kept in sync by test).
-pub(crate) fn wants_screenshot(verb: &BrowserVerb) -> bool {
-    matches!(
-        verb,
-        BrowserVerb::Navigate
-            | BrowserVerb::Click
-            | BrowserVerb::Fill
-            | BrowserVerb::Hover
-            | BrowserVerb::Drag
-            | BrowserVerb::PressKey
-            | BrowserVerb::Download
-    )
-}
+use crate::wants_screenshot;
 
 #[cfg(test)]
 mod tests {
@@ -299,10 +332,10 @@ mod tests {
     #[test]
     fn read_only_verbs_never_capture() {
         let t = ScreenshotThrottle::new(Duration::from_millis(0));
-        assert_eq!(t.decide(&GetText, true), ScreenshotDecision::Throttled);
+        assert_eq!(t.decide(&GetText, true), ScreenshotDecision::NotEligible);
         assert_eq!(
             t.decide(&AccessibilityTree, true),
-            ScreenshotDecision::Throttled
+            ScreenshotDecision::NotEligible
         );
         assert_eq!(t.captured(), 0);
     }
@@ -318,34 +351,28 @@ mod tests {
     }
 
     #[test]
-    fn throttle_gate_matches_bridge_wants_screenshot() {
-        // Keep the local gate in lockstep with the bridge's (both must agree
-        // on which verbs warrant a screenshot).
-        for verb in [
-            Navigate,
-            Click,
-            Fill,
-            Hover,
-            Drag,
-            PressKey,
-            Download,
-            Screenshot,
-            AccessibilityTree,
-            GetText,
-            GetHtml,
-            Snapshot,
-            Evaluate,
-        ] {
-            let bridge_gate = webai_bridge_gate(verb);
-            assert_eq!(wants_screenshot(&verb), bridge_gate, "verb {verb:?}");
+    fn all_thirteen_verbs_have_a_gate_verdict() {
+        // Single fact source: perf now calls the bridge's pub(crate)
+        // `wants_screenshot` directly; assert the full 13-verb table so a
+        // gate change is deliberate.
+        let mutating = [
+            Navigate, Click, Fill, Hover, Drag, PressKey, Download, Evaluate,
+        ];
+        let read_only = [Screenshot, AccessibilityTree, GetText, GetHtml, Snapshot];
+        for verb in mutating {
+            assert!(wants_screenshot(&verb), "{verb:?} must want a screenshot");
+            assert_eq!(decide_wrapper(&verb, true), Decision::Capture);
+        }
+        for verb in read_only {
+            assert!(!wants_screenshot(&verb), "{verb:?} must not screenshot");
+            assert_eq!(decide_wrapper(&verb, true), Decision::NotEligible);
         }
     }
 
-    /// Re-implementation of the bridge's private gate for the lockstep test.
-    fn webai_bridge_gate(verb: BrowserVerb) -> bool {
-        matches!(
-            verb,
-            Navigate | Click | Fill | Hover | Drag | PressKey | Download
-        )
+    fn decide_wrapper(verb: &BrowserVerb, visible: bool) -> Decision {
+        ScreenshotThrottle::new(Duration::from_millis(0)).decide(verb, visible)
     }
+
+    // Local alias so the table test stays short.
+    use ScreenshotDecision as Decision;
 }

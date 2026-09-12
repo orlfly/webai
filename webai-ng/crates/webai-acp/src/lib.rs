@@ -7,17 +7,14 @@
 //! ACP server share the same registry so local and remote observers agree.
 
 pub mod jsonrpc;
+pub mod net;
 pub mod transport;
 
 pub use jsonrpc::{
     response_to_json, AcpError, AcpRequest, AcpResponse, AcpSessionRegistry, Dispatcher,
 };
-pub use transport::{decode_frame, event_notify, handle_line, pump, TransportError};
+pub use transport::{
+    accept_connection, decode_frame, event_notify, handle_line, pump, TransportError,
+};
 
-pub mod net;
-
-pub use net::{policy_disabled_by_language, Admission, NetworkPolicy, PolicyError, DEFAULT_BIND};
-
-/// Turn a user prompt into a `SessionEvent` sequence (alias for handler trait
-/// used by the dispatcher).
 pub use jsonrpc::AcpHandler;
