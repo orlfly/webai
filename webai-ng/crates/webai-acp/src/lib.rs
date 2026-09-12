@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use webai_agent::AgentSession;
 
+pub mod net;
+
+pub use net::{policy_disabled_by_language, Admission, NetworkPolicy, PolicyError, DEFAULT_BIND};
+
 /// Registry of live ACP sessions (ARCHITECTURE.md §4.10). Shared between the ACP
 /// server and the TUI so local and remote observers see the same sessions.
 #[derive(Debug, Clone, Default)]
@@ -84,7 +88,11 @@ mod tests {
             Arc::new(SharedMemoryStore::new()),
             vec![],
         ));
-        Arc::new(AgentSession::new(id, loop_, Arc::new(SharedMemoryStore::new())))
+        Arc::new(AgentSession::new(
+            id,
+            loop_,
+            Arc::new(SharedMemoryStore::new()),
+        ))
     }
 
     #[test]

@@ -51,8 +51,32 @@ pub struct JsonlSessionRecorder {
 }
 
 impl JsonlSessionRecorder {
+    /// Validate a session id for safe path composition (FR-8 / M-5). Only
+    /// alphanumeric, `-`, `_` and `.` are allowed; anything that could climb
+    /// out of the sessions directory (`/`, `\`, `..`, leading `.`) is refused
+    /// so `session_id` can never traverse.
+    pub fn validate_session_id(session_id: &str) -> Result<(), MemoryError> {
+        let ok = !session_id.is_empty()
+            && !session_id.starts_with('.')
+            && session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            && !session_id.contains("..");
+        if ok {
+            Ok(())
+        } else {
+            Err(MemoryError::BackendUnavailable(format!(
+                "unsafe session id rejected: {session_id:?}"
+            )))
+        }
+    }
+
     pub fn new_for_dir(collab_dir: &Path, session_id: &str) -> Result<Self, MemoryError> {
-        std::fs::create_dir_all(collab_dir).map_err(|e| MemoryError::BackendUnavailable(e.to_string()))?;
+        // Path-traversal guard: the id is composed into a file name, so a
+        // hostile id (`../x`, `a/b`, `..`) must never escape the directory.
+        Self::validate_session_id(session_id)?;
+        std::fs::create_dir_all(collab_dir)
+            .map_err(|e| MemoryError::BackendUnavailable(e.to_string()))?;
         Ok(Self {
             path: collab_dir.join(format!("{session_id}.jsonl")),
             lines: Arc::new(RwLock::new(Vec::new())),
@@ -65,15 +89,26 @@ impl JsonlSessionRecorder {
 
     /// Append a single JSON-line and flush.
     pub fn record(&self, line: serde_json::Value) -> Result<(), MemoryError> {
-        let mut lines = self.lines.write().map_err(|_| MemoryError::BackendUnavailable("lock poisoned".into()))?;
+        let mut lines = self
+            .lines
+            .write()
+            .map_err(|_| MemoryError::BackendUnavailable("lock poisoned".into()))?;
         lines.push(line.to_string());
         Ok(())
     }
 
     /// Scan a session file, skipping a trailing truncated (invalid JSON) line.
     pub fn recovery_scan(&self) -> Vec<String> {
-        let lines = self.lines.read().map_err(|_| ()).map(|g| g.clone()).unwrap_or_default();
-        lines.into_iter().filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()).collect()
+        let lines = self
+            .lines
+            .read()
+            .map_err(|_| ())
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        lines
+            .into_iter()
+            .filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
+            .collect()
     }
 }
 
@@ -107,14 +142,22 @@ impl SharedMemoryStore {
             return Err(MemoryError::BackendUnavailable("memory disabled".into()));
         }
         entry.tags.insert(0, format!("script:{}", entry.verb));
-        let mut m = self.scripts.write().map_err(|_| MemoryError::BackendUnavailable("lock poisoned".into()))?;
+        let mut m = self
+            .scripts
+            .write()
+            .map_err(|_| MemoryError::BackendUnavailable("lock poisoned".into()))?;
         m.insert(entry.id.clone(), entry);
         Ok(())
     }
 
     /// Recall up to `limit` script entries matching `task` (best-effort).
     pub fn recall_scripts(&self, task: &str, limit: usize) -> Vec<ScriptMemoryEntry> {
-        let m = self.scripts.read().map_err(|_| ()).map(|g| g.clone()).unwrap_or_default();
+        let m = self
+            .scripts
+            .read()
+            .map_err(|_| ())
+            .map(|g| g.clone())
+            .unwrap_or_default();
         m.values()
             .filter(|e| e.task.contains(task))
             .take(limit)
@@ -155,11 +198,19 @@ mod tests {
     #[test]
     fn write_and_recall_script_entries() {
         let store = SharedMemoryStore::new();
-        store.write_script(sample_entry("click", "submit login form")).unwrap();
-        store.write_script(sample_entry("fill", "submit login form")).unwrap();
+        store
+            .write_script(sample_entry("click", "submit login form"))
+            .unwrap();
+        store
+            .write_script(sample_entry("fill", "submit login form"))
+            .unwrap();
         let hits = store.recall_scripts("login form", 10);
         assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|e| e.tags.first().map(|t| t.starts_with("script:")).unwrap_or(false)));
+        assert!(hits.iter().all(|e| e
+            .tags
+            .first()
+            .map(|t| t.starts_with("script:"))
+            .unwrap_or(false)));
         assert_eq!(store.len(), 2);
     }
 
@@ -182,10 +233,7 @@ mod tests {
 
     #[test]
     fn jsonl_recorder_drops_trailing_truncated_line() {
-        let dir = std::env::temp_dir().join(format!(
-            "webai-ng-mem-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("webai-ng-mem-test-{}", std::process::id()));
         let rec = JsonlSessionRecorder::new_for_dir(&dir, "s1").unwrap();
         rec.record(serde_json::json!({"ok": true})).unwrap();
         rec.record(serde_json::json!({"ok": false})).unwrap();
@@ -196,6 +244,43 @@ mod tests {
         // Recovery must skip the malformed line.
         let healthy = rec.recovery_scan();
         assert_eq!(healthy.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-8 / M-5: a hostile session id must never compose into an escaping
+    /// path. Covers the traversal payload set (`..`, `/`, `\`, absolute,
+    /// leading dot, empty).
+    #[test]
+    fn session_id_traversal_payloads_are_rejected() {
+        let payloads = [
+            "../evil",
+            "..\\evil",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "..",
+            ".hidden",
+            "",
+            "id/../../../x",
+            "id\n",
+        ];
+        for p in payloads {
+            assert!(
+                JsonlSessionRecorder::validate_session_id(p).is_err(),
+                "payload {p:?} must be rejected"
+            );
+        }
+        // A safe id still validates.
+        assert!(JsonlSessionRecorder::validate_session_id("sess-9_x").is_ok());
+    }
+
+    /// The recorder constructor itself refuses to create an escaping file.
+    #[test]
+    fn recorder_never_creates_file_outside_dir() {
+        let dir = std::env::temp_dir().join(format!("webai-mem-guard-{}", std::process::id()));
+        let err = JsonlSessionRecorder::new_for_dir(&dir, "../escape").unwrap_err();
+        assert!(err.to_string().contains("unsafe session id"));
+        // No file was created outside the (even nonexistent) dir.
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
