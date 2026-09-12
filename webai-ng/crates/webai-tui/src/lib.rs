@@ -3,11 +3,15 @@
 //! The TUI frontend talks **only** to the session background service
 //! (`session`, ARCHITECTURE.md §4.11): it holds an `Arc<AgentSession>` and
 //! streams `SessionEvent`s out over a bounded mpsc channel. The frontend never
-//! imports the bridge/webkit layers directly (§2 boundary 1). The full ratatui
-//! app and image pipelines land in M5.
+//! imports the bridge/webkit layers directly (§2 boundary 1). `app` renders
+//! the streaming transcript with the §4.11 keymap; `run` drives the event
+//! loop with terminal lifecycle guard; `images` adds the terminal image
+//! pipeline.
 
+pub mod app;
 pub mod session;
 
+pub use app::{App, ChatLine, KeyAction, PAGE_ROWS, RENDER_TICK_MS};
 pub use session::{PromptHandler, SessionBackend, COALESCE_STEP_BURST, EVENT_CHANNEL_CAPACITY};
 
 /// A command the frontend sends to the session background task.
@@ -17,6 +21,16 @@ pub enum UiCommand {
     Send { text: String },
     /// Ask the background task to stop cleanly.
     Shutdown,
+}
+
+/// An event streamed from the session backend to the frontend: either a
+/// streaming text delta (rendered incrementally) or a status change.
+#[derive(Debug, Clone)]
+pub enum UiEvent {
+    /// Streaming text delta appended to the transcript.
+    Delta(String),
+    /// The loop finished with a terminal state message.
+    Finished(String),
 }
 
 /// Build a terminal session state for a completion result (used by the
