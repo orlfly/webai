@@ -172,7 +172,10 @@ mod tests {
             bridge.evaluate_javascript("1+1", 100).await,
             Err(WebkitError::CogLaunch(_))
         ));
-        assert!(matches!(bridge.screenshot().await, Err(WebkitError::CogLaunch(_))));
+        assert!(matches!(
+            bridge.screenshot().await,
+            Err(WebkitError::CogLaunch(_))
+        ));
         assert!(matches!(
             bridge.inject_user_script("x").await,
             Err(WebkitError::CogLaunch(_))

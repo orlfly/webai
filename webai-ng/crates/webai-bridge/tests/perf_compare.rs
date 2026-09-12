@@ -76,3 +76,47 @@ fn perf_before_after_comparison() {
         "throttle must cut screenshot count substantially (got {shots})"
     );
 }
+
+/// Deterministic throttle comparison: an injected (fake) clock advances
+/// instantly, so CI never depends on real sleeps (task 68 AC3).
+#[derive(Debug)]
+struct FakeClock(std::sync::Mutex<Instant>);
+
+impl webai_bridge::perf::Clock for FakeClock {
+    fn now(&self) -> Instant {
+        *self.0.lock().unwrap()
+    }
+}
+
+#[test]
+fn throttle_with_injected_clock_is_deterministic() {
+    let start = Instant::now();
+    let clock = std::sync::Arc::new(FakeClock(std::sync::Mutex::new(start)));
+    let t = webai_bridge::perf::ScreenshotThrottle::with_clock(
+        Duration::from_secs(60),
+        Box::new(SharedClock(std::sync::Arc::clone(&clock))),
+    );
+
+    let click = BrowserVerb::Click;
+    assert_eq!(t.decide(&click, true), ScreenshotDecision::Capture);
+    // Clock has not moved: burst merges, no real time passes.
+    assert_eq!(t.decide(&click, true), ScreenshotDecision::Throttled);
+    assert_eq!(t.captured(), 1);
+    assert_eq!(t.throttled(), 1);
+
+    // Advance the fake clock past the interval: capture again, zero sleep.
+    *clock.0.lock().unwrap() = start + Duration::from_secs(61);
+    assert_eq!(t.decide(&click, true), ScreenshotDecision::Capture);
+    assert_eq!(t.captured(), 2);
+}
+
+/// Shares one FakeClock between the test and the throttle (the throttle owns
+/// its clock box, so the test holds a second handle to advance it).
+#[derive(Debug)]
+struct SharedClock(std::sync::Arc<FakeClock>);
+
+impl webai_bridge::perf::Clock for SharedClock {
+    fn now(&self) -> Instant {
+        self.0.now()
+    }
+}
