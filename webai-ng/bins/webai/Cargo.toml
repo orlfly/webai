@@ -17,3 +17,5 @@ webai-config = { path = "../../crates/webai-config" }
 webai-agent = { path = "../../crates/webai-agent" }
 webai-acp = { path = "../../crates/webai-acp" }
 webai-tui = { path = "../../crates/webai-tui" }
+webai-webkit = { path = "../../crates/webai-webkit" }
+tokio = { workspace = true }

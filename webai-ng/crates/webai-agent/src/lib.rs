@@ -121,61 +121,6 @@ pub enum ChatMessage {
     Assistant(String),
 }
 
-/// The durable session container (ARCHITECTURE.md §4.9): transcript +
-/// `Arc<AgentLoop>` + optional `Arc<SharedMemoryStore>`.
-pub struct AgentSession {
-    session_id: String,
-    transcript: Mutex<Vec<ChatMessage>>,
-    loop_: Arc<AgentLoop>,
-    memory: Arc<SharedMemoryStore>,
-}
-
-/// Manual `Debug` impl because `AgentLoop` contains a `dyn Tool` which is not
-/// `Debug`.
-impl std::fmt::Debug for AgentSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentSession")
-            .field("session_id", &self.session_id)
-            .field("transcript_len", &self.transcript.lock().unwrap().len())
-            .finish()
-    }
-}
-
-impl AgentSession {
-    pub fn new(
-        session_id: impl Into<String>,
-        loop_: Arc<AgentLoop>,
-        memory: Arc<SharedMemoryStore>,
-    ) -> Self {
-        Self {
-            session_id: session_id.into(),
-            transcript: Mutex::new(Vec::new()),
-            loop_,
-            memory,
-        }
-    }
-
-    pub fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    pub fn transcript(&self) -> Vec<ChatMessage> {
-        self.transcript.lock().unwrap().clone()
-    }
-
-    pub fn push(&self, message: ChatMessage) {
-        self.transcript.lock().unwrap().push(message);
-    }
-
-    pub fn agent_loop(&self) -> &Arc<AgentLoop> {
-        &self.loop_
-    }
-
-    pub fn memory(&self) -> &Arc<SharedMemoryStore> {
-        &self.memory
-    }
-}
-
 /// A stub tool named `echo` for exercising the registry in tests.
 #[cfg(test)]
 pub struct EchoTool;
