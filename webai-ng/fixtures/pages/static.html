@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<!--
+  webai-ng benchmark fixture: static page (PRODUCT-DESIGN.md §6 M-6).
+  Contract: >= 100 DOM nodes, background image, deterministic content.
+  Counted by tests/fixture_pages.rs; consumed by perf and e2e suites.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>webai benchmark: static</title>
+  <style>
+    body { background-image: url("data:image/svg+xml;base64," +
+      "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0IiBoZWlnaHQ9IjQiPjxyZWN0IHdpZHRoPSI0IiBoZWlnaHQ9IjQiIGZpbGw9IiNlZWUiLz48L3N2Zz4=");
+      background-color: #f4f4f4; }
+    main { max-width: 60em; margin: 0 auto; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1 id="title">Static benchmark page</h1>
+    <p id="intro">This page is a fixed fixture for M-6 memory measurement and the 13-verb smoke matrix.</p>
+    <!-- rows: 20 sections x 5 elements = 100+ nodes -->
+    <div id="rows">
+      <!-- ROWS injected below at authoring time; keep static, no JS. -->
+      <section class="row"><h2>Section 1</h2><p>Text 1</p><a href="#1">Link 1</a><button data-i="1">Btn 1</button></section>
+      <section class="row"><h2>Section 2</h2><p>Text 2</p><a href="#2">Link 2</a><button data-i="2">Btn 2</button></section>
+      <section class="row"><h2>Section 3</h2><p>Text 3</p><a href="#3">Link 3</a><button data-i="3">Btn 3</button></section>
+      <section class="row"><h2>Section 4</h2><p>Text 4</p><a href="#4">Link 4</a><button data-i="4">Btn 4</button></section>
+      <section class="row"><h2>Section 5</h2><p>Text 5</p><a href="#5">Link 5</a><button data-i="5">Btn 5</button></section>
+      <section class="row"><h2>Section 6</h2><p>Text 6</p><a href="#6">Link 6</a><button data-i="6">Btn 6</button></section>
+      <section class="row"><h2>Section 7</h2><p>Text 7</p><a href="#7">Link 7</a><button data-i="7">Btn 7</button></section>
+      <section class="row"><h2>Section 8</h2><p>Text 8</p><a href="#8">Link 8</a><button data-i="8">Btn 8</button></section>
+      <section class="row"><h2>Section 9</h2><p>Text 9</p><a href="#9">Link 9</a><button data-i="9">Btn 9</button></section>
+      <section class="row"><h2>Section 10</h2><p>Text 10</p><a href="#10">Link 10</a><button data-i="10">Btn 10</button></section>
+      <section class="row"><h2>Section 11</h2><p>Text 11</p><a href="#11">Link 11</a><button data-i="11">Btn 11</button></section>
+      <section class="row"><h2>Section 12</h2><p>Text 12</p><a href="#12">Link 12</a><button data-i="12">Btn 12</button></section>
+      <section class="row"><h2>Section 13</h2><p>Text 13</p><a href="#13">Link 13</a><button data-i="13">Btn 13</button></section>
+      <section class="row"><h2>Section 14</h2><p>Text 14</p><a href="#14">Link 14</a><button data-i="14">Btn 14</button></section>
+      <section class="row"><h2>Section 15</h2><p>Text 15</p><a href="#15">Link 15</a><button data-i="15">Btn 15</button></section>
+      <section class="row"><h2>Section 16</h2><p>Text 16</p><a href="#16">Link 16</a><button data-i="16">Btn 16</button></section>
+      <section class="row"><h2>Section 17</h2><p>Text 17</p><a href="#17">Link 17</a><button data-i="17">Btn 17</button></section>
+      <section class="row"><h2>Section 18</h2><p>Text 18</p><a href="#18">Link 18</a><button data-i="18">Btn 18</button></section>
+      <section class="row"><h2>Section 19</h2><p>Text 19</p><a href="#19">Link 19</a><button data-i="19">Btn 19</button></section>
+      <section class="row"><h2>Section 20</h2><p>Text 20</p><a href="#20">Link 20</a><button data-i="20">Btn 20</button></section>
+      <section class="row"><h2>Section 21</h2><p>Text 21</p><a href="#21">Link 21</a><button data-i="21">Btn 21</button></section>
+      <section class="row"><h2>Section 22</h2><p>Text 22</p><a href="#22">Link 22</a><button data-i="22">Btn 22</button></section>
+      <section class="row"><h2>Section 23</h2><p>Text 23</p><a href="#23">Link 23</a><button data-i="23">Btn 23</button></section>
+      <section class="row"><h2>Section 24</h2><p>Text 24</p><a href="#24">Link 24</a><button data-i="24">Btn 24</button></section>
+      <section class="row"><h2>Section 25</h2><p>Text 25</p><a href="#25">Link 25</a><button data-i="25">Btn 25</button></section>
+    </div>
+    <footer><p id="foot">25 sections x 5 nodes = 125+ DOM nodes.</p></footer>
+  </main>
+</body>
+</html>

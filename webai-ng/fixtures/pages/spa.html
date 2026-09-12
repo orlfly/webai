@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<!--
+  webai-ng benchmark fixture: SPA (PRODUCT-DESIGN.md §6 M-6).
+
+  Rendering contract (documented, deterministic):
+  - On load, the app performs ONE XHR against `./items.json` (relative, so it
+    also works from a static file server shipped with the repo).
+  - It renders at most 200 nodes: a header + a <ul> of 100 <li class="item">
+    rows (2 nodes each) = 202 nodes total after render; the XHR payload is
+    capped at 100 items exactly.
+  - `document.title` becomes "spa-ready" after render so e2e suites can await
+    readiness without polling the DOM.
+  - If the XHR fails (e.g. file:// context), the page falls back to a single
+    <li class="offline"> row: loading never hangs.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>webai benchmark: spa</title>
+</head>
+<body>
+  <h1 id="app-title">SPA benchmark app</h1>
+  <ul id="items"></ul>
+  <script>
+    (function () {
+      var ul = document.getElementById("items");
+      function render(items) {
+        var capped = items.slice(0, 100); // contract: <= 200 rendered nodes
+        for (var i = 0; i < capped.length; i++) {
+          var li = document.createElement("li");
+          li.className = "item";
+          li.textContent = capped[i];
+          ul.appendChild(li);
+        }
+        document.title = "spa-ready";
+      }
+      function offline() {
+        var li = document.createElement("li");
+        li.className = "offline";
+        li.textContent = "offline fallback";
+        ul.appendChild(li);
+        document.title = "spa-ready";
+      }
+      try {
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", "./items.json");
+        xhr.onload = function () {
+          try { render(JSON.parse(xhr.responseText)); } catch (e) { offline(); }
+        };
+        xhr.onerror = offline;
+        xhr.send();
+      } catch (e) { offline(); }
+    })();
+  </script>
+</body>
+</html>
