@@ -1,14 +1,24 @@
 //! webai-bridge: jcode_host equivalent — tool dispatch, screenshots, download, snapshot.
 //!
-//! Stub skeleton for the webai-ng AI browser (M1-4). Defines the `dispatch` entry
-//! point (ARCHITECTURE.md §4.8): it composes a script via `webai-script`, hands it
-//! to `webai-webkit`, and merges the execute/verify payloads into a
-//! `BrowserToolResponse`, automatically capturing a screenshot after non-read-only
-//! actions. A real WebKit/FFI backend lands in M2.
+//! Implements the bridge dispatch entry (ARCHITECTURE.md §4.8): it composes a
+//! script via `webai-script`, hands it to `webai-webkit`, and merges the
+//! execute/verify two-phase payloads into a `BrowserToolResponse`.
+//!
+//! Merge rule: `ok = execute.ok && verify.ok`. A verify failure is surfaced
+//! structurally with `phase = "verify"` and the JS exception text (定论二) —
+//! never swallowed as `unknown error`. The LLM repair call (M4-6) is a
+//! follow-up; this task only surfaces the failure structurally.
+//!
+//! In a no-FFI environment (dev machine) the `WebkitBridge` canned-response
+//! injection path covers the full dispatch chain (ARCHITECTURE.md §9 layer 3).
 
-use webai_protocol::{BrowserToolRequest, BrowserToolResponse};
+use webai_protocol::{
+    codes, BrowserToolError, BrowserToolRequest, BrowserToolResponse, Request, Response,
+};
 use webai_script::{compose, ScriptError};
 use webai_webkit::{EvaluateResult, WebkitBridge, WebkitError};
+
+pub mod download;
 
 /// Structured error from the bridge layer.
 #[derive(Debug, thiserror::Error)]
@@ -19,12 +29,19 @@ pub enum BridgeError {
     Webkit(#[from] WebkitError),
     #[error("missing required argument: {0}")]
     MissingArg(&'static str),
+    #[error("unknown bridge method: {0}")]
+    UnknownMethod(String),
 }
 
 /// Whether an action mutates the page and therefore warrants an auto-screenshot.
 fn wants_screenshot(verb: &webai_protocol::BrowserVerb) -> bool {
-    use webai_protocol::BrowserVerb::{Click, Download, Drag, Evaluate, Fill, Hover, Navigate, PressKey};
-    matches!(verb, Click | Download | Drag | Evaluate | Fill | Hover | Navigate | PressKey)
+    use webai_protocol::BrowserVerb::{
+        Click, Download, Drag, Evaluate, Fill, Hover, Navigate, PressKey,
+    };
+    matches!(
+        verb,
+        Click | Download | Drag | Evaluate | Fill | Hover | Navigate | PressKey
+    )
 }
 
 /// The bridge dispatcher (ARCHITECTURE.md §4.8).
@@ -41,39 +58,152 @@ impl Bridge {
         &self.webkit
     }
 
-    /// Dispatch a browser-tool request end to end.
-    pub async fn dispatch(&self, req: &BrowserToolRequest) -> Result<BrowserToolResponse, BridgeError> {
+    /// Bridge-protocol entry: `dispatch(Request) -> Response`.
+    ///
+    /// Parses the request method and params, dispatches to
+    /// [`Self::handle_tool_call`], and wraps the result in a protocol
+    /// [`Response`] carrying the same `id`.
+    pub async fn dispatch(&self, req: &Request) -> Response {
+        let id = req.id;
+        match req.method.as_str() {
+            "bridge.tool" => {
+                // params: { verb, args }
+                let verb = match req.params.get("verb").and_then(|v| v.as_str()) {
+                    Some(v) => webai_protocol::BrowserVerb::from_name(v),
+                    None => {
+                        return Response::err(
+                            id,
+                            codes::INVALID_PARAMS,
+                            "bridge.tool requires a `verb` param",
+                        )
+                    }
+                };
+                let args = req.params.get("args").cloned().unwrap_or_default();
+                let tool_req = BrowserToolRequest { verb, args };
+                match self.handle_tool_call(&tool_req).await {
+                    Ok(resp) => Response::ok(id, serde_json::to_value(resp).unwrap_or_default()),
+                    Err(e) => Response::err(id, codes::INTERNAL_ERROR, e.to_string()),
+                }
+            }
+            other => Response::err(
+                id,
+                codes::METHOD_NOT_FOUND,
+                format!("unknown method: {other}"),
+            ),
+        }
+    }
+
+    /// Handle a browser-tool request end to end.
+    ///
+    /// Composes the two-phase script, evaluates it in WebKit, and merges the
+    /// execute/verify payloads. Download is a Rust-side operation (the page
+    /// script only emits `needs_rust_download`), so it is routed to
+    /// [`Self::handle_download`].
+    pub async fn handle_tool_call(
+        &self,
+        req: &BrowserToolRequest,
+    ) -> Result<BrowserToolResponse, BridgeError> {
+        if req.verb == webai_protocol::BrowserVerb::Download {
+            return self.handle_download(&req.args).await;
+        }
         let module = compose(req)?;
         let result = self
             .webkit
             .evaluate_javascript(&module.execute_src, 30_000)
             .await?;
-        self.merge(req, module.verify_src, result).await
+        self.merge(req, result).await
     }
 
-    /// Merge the execute/verify phase result into a response, capturing a
-    /// screenshot after mutating actions.
+    /// Handle a download request: fetch the URL in Rust and persist the body.
+    pub async fn handle_download(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<BrowserToolResponse, BridgeError> {
+        let directory = args
+            .get("directory")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        match download::download(args, directory.as_deref()).await {
+            Ok(result) => Ok(BrowserToolResponse {
+                ok: true,
+                result: Some(serde_json::json!({
+                    "ok": true,
+                    "url": result.url,
+                    "filename": result.filename,
+                    "saved_to": result.saved_to,
+                    "directory": result.directory,
+                    "bytes": result.bytes,
+                })),
+                error: None,
+                image_path: None,
+            }),
+            Err(e) => Ok(BrowserToolResponse {
+                ok: false,
+                result: None,
+                error: Some(BrowserToolError {
+                    code: codes::INTERNAL_ERROR,
+                    message: e.to_string(),
+                    detail: Some(e.code().to_owned()),
+                }),
+                image_path: None,
+            }),
+        }
+    }
+
+    /// Merge the execute/verify phase result into a response.
+    ///
+    /// The composed module's driver returns `{ execute, verify, args }`; the
+    /// evaluate result JSON carries both phase payloads. `ok = execute.ok &&
+    /// verify.ok`. A verify failure is surfaced with `phase = "verify"` and the
+    /// JS exception text.
     async fn merge(
         &self,
         req: &BrowserToolRequest,
-        verify_src: String,
         eval: EvaluateResult,
     ) -> Result<BrowserToolResponse, BridgeError> {
-        let ok = eval.json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let json = &eval.json;
+        let execute = json.get("execute").cloned().unwrap_or_default();
+        let verify = json.get("verify").cloned().unwrap_or_default();
+
+        let execute_ok = execute.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let verify_ok = verify.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let ok = execute_ok && verify_ok;
+
+        // Surface the failing phase's error text (定论二), never "unknown error".
+        let error = if !ok {
+            let (phase, phase_json) = if !execute_ok {
+                ("execute", &execute)
+            } else {
+                ("verify", &verify)
+            };
+            let detail = phase_json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!("{phase} phase failed with no error detail: {phase_json}")
+                });
+            Some(BrowserToolError {
+                code: codes::INTERNAL_ERROR,
+                message: format!("{phase} phase failed"),
+                detail: Some(detail),
+            })
+        } else {
+            None
+        };
+
         let mut response = BrowserToolResponse {
             ok,
-            result: Some(eval.json),
-            error: None,
+            result: Some(json.clone()),
+            error,
             image_path: None,
         };
-        let _ = &verify_src;
 
         if ok && wants_screenshot(&req.verb) {
             // Screenshot capture is silent on failure (does not change the
             // operation's success semantics, ARCHITECTURE.md §4.8).
             if let Ok(png) = self.webkit.screenshot().await {
                 if !png.is_empty() {
-                    // Real persistence to a temp PNG lands with M2's FFI backend.
                     response.image_path = Some("/tmp/webai-stub.png".into());
                 }
             }
@@ -85,8 +215,112 @@ impl Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webai_protocol::BrowserVerb;
     use serde_json::json;
+    use webai_protocol::BrowserVerb;
+
+    fn req(verb: BrowserVerb, args: serde_json::Value) -> BrowserToolRequest {
+        BrowserToolRequest { verb, args }
+    }
+
+    /// Build a canned WebkitBridge that returns a scripted two-phase payload.
+    fn canned_bridge(execute_ok: bool, verify_ok: bool) -> WebkitBridge {
+        WebkitBridge::with_canned(webai_webkit::CannedBackend {
+            evaluate_result: Some(json!({
+                "execute": { "ok": execute_ok, "stage": "execute" },
+                "verify": { "ok": verify_ok, "stage": "verify" },
+                "args": {}
+            })),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn merge_ok_true_when_both_phases_ok() {
+        let bridge = Bridge::new(canned_bridge(true, true));
+        let resp = bridge
+            .handle_tool_call(&req(BrowserVerb::GetText, json!({})))
+            .await
+            .unwrap();
+        assert!(resp.ok);
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn merge_ok_false_when_execute_fails() {
+        let bridge = Bridge::new(canned_bridge(false, true));
+        let resp = bridge
+            .handle_tool_call(&req(BrowserVerb::GetText, json!({})))
+            .await
+            .unwrap();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error present");
+        assert!(err.message.contains("execute"));
+    }
+
+    #[tokio::test]
+    async fn merge_ok_false_when_verify_fails_with_phase_and_error() {
+        let bridge = Bridge::new(canned_bridge(true, false));
+        let resp = bridge
+            .handle_tool_call(&req(BrowserVerb::GetText, json!({})))
+            .await
+            .unwrap();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error present");
+        assert!(err.message.contains("verify"), "phase must be verify");
+        assert!(err.detail.is_some(), "must carry JS error detail");
+    }
+
+    #[tokio::test]
+    async fn merge_ok_false_when_both_fail() {
+        let bridge = Bridge::new(canned_bridge(false, false));
+        let resp = bridge
+            .handle_tool_call(&req(BrowserVerb::GetText, json!({})))
+            .await
+            .unwrap();
+        assert!(!resp.ok);
+        assert!(resp.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn dispatch_bridge_tool_returns_response() {
+        let bridge = Bridge::new(canned_bridge(true, true));
+        let req = Request {
+            id: 7,
+            method: "bridge.tool".into(),
+            params: json!({ "verb": "get_text", "args": {} }),
+        };
+        let resp = bridge.dispatch(&req).await;
+        assert_eq!(resp.id, 7);
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_method_returns_method_not_found() {
+        let bridge = Bridge::new(WebkitBridge::new());
+        let req = Request {
+            id: 1,
+            method: "bogus".into(),
+            params: json!({}),
+        };
+        let resp = bridge.dispatch(&req).await;
+        assert_eq!(resp.id, 1);
+        let err = resp.error.expect("error present");
+        assert_eq!(err.code, codes::METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dispatch_missing_verb_returns_invalid_params() {
+        let bridge = Bridge::new(WebkitBridge::new());
+        let req = Request {
+            id: 2,
+            method: "bridge.tool".into(),
+            params: json!({}),
+        };
+        let resp = bridge.dispatch(&req).await;
+        let err = resp.error.expect("error present");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
 
     #[test]
     fn wants_screenshot_marks_mutating_verbs() {
@@ -97,23 +331,5 @@ mod tests {
         assert!(!wants_screenshot(&Screenshot));
         assert!(!wants_screenshot(&Snapshot));
         assert!(!wants_screenshot(&GetText));
-    }
-
-    #[tokio::test]
-    async fn merge_sets_ok_from_execute_result() {
-        let bridge = Bridge::new(WebkitBridge::new());
-        let req = BrowserToolRequest {
-            verb: BrowserVerb::GetText,
-            args: json!({}),
-        };
-        let eval = EvaluateResult {
-            json: json!({ "ok": true, "text": "hello" }),
-            screenshot_path: None,
-        };
-        let resp = bridge
-            .merge(&req, "export const verify=()=>({ok:true})".to_string(), eval)
-            .await
-            .unwrap();
-        assert!(resp.ok);
     }
 }

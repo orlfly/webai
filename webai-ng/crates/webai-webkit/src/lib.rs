@@ -185,7 +185,7 @@ pub struct WebkitBridge {
 
 /// A canned backend for tests: returns scripted responses without WebKit.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct CannedBackend {
+pub struct CannedBackend {
     pub(crate) evaluate_result: Option<serde_json::Value>,
     pub(crate) screenshot_png: Option<Vec<u8>>,
     pub(crate) load_events: Vec<LoadSnapshot>,
@@ -219,7 +219,7 @@ impl WebkitBridge {
 
     /// Construct a bridge with a canned backend for tests (no FFI needed).
     #[cfg(test)]
-    pub(crate) fn with_canned(canned: CannedBackend) -> Self {
+    pub fn with_canned(canned: CannedBackend) -> Self {
         Self {
             backend: Arc::new(Mutex::new(None)),
             last_load_uri: Arc::new(Mutex::new(None)),
