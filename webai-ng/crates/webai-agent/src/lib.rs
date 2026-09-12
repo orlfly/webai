@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex};
 use webai_llm::LlmClient;
 use webai_memory::SharedMemoryStore;
 
+pub mod plan_loop;
+
+pub use plan_loop::{requires_plan, LoopError, LoopGuards, PLAN_DIRECTIVE, STATE_BLOCK_MARKER};
+
 /// The core tools (browser / memory / filesystem / llm / acp_notify) plus
 /// terminate. Each tool handles one call and returns structured output.
 /// The trait is intentionally minimal; async dispatch is added in M4.
