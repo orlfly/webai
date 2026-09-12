@@ -2254,7 +2254,9 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
+ "webai-config",
  "webai-protocol",
 ]
 
