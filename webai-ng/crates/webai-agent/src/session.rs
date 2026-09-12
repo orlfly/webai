@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use webai_memory::{JsonlSessionRecorder, MemoryError, SharedMemoryStore};
+use webai_memory::session_log::JsonlSessionLog;
+use webai_memory::{MemoryError, SharedMemoryStore};
 
 use crate::AgentLoop;
 use crate::ChatMessage;
@@ -115,7 +116,7 @@ pub struct AgentSession {
     state: Mutex<SessionState>,
     loop_: Arc<AgentLoop>,
     memory: Arc<SharedMemoryStore>,
-    recorder: Option<JsonlSessionRecorder>,
+    recorder: Option<Mutex<JsonlSessionLog>>,
 }
 
 /// Manual `Debug` impl because `AgentLoop` contains a `dyn Tool` which is not
@@ -160,10 +161,10 @@ impl AgentSession {
     ) -> Result<Self, MemoryError> {
         let id = session_id.into();
         let recorder = if options.enable_jsonl {
-            Some(JsonlSessionRecorder::new_for_dir(
-                &options.sessions_dir,
-                &id,
-            )?)
+            Some(Mutex::new(
+                JsonlSessionLog::open(&options.sessions_dir, &id)
+                    .map_err(|e| MemoryError::BackendUnavailable(e.to_string()))?,
+            ))
         } else {
             None
         };
@@ -186,12 +187,14 @@ impl AgentSession {
     }
 
     /// The JSONL recorder handle (session log, owned by webai-memory).
-    pub fn recorder(&self) -> Option<&JsonlSessionRecorder> {
+    pub fn recorder(&self) -> Option<&Mutex<JsonlSessionLog>> {
         self.recorder.as_ref()
     }
 
-    /// Serialize the full transcript + current state to a JSONL line for
-    /// durable storage (FR-5). Only valid while the session is running.
+    /// Serialize the full transcript + current state to the JSONL session log
+    /// (FR-5). The log is the real-file `JsonlSessionLog` from webai-memory:
+    /// every record is written **and flushed** immediately, so a crash loses
+    /// at most the final truncated line.
     pub fn persist_snapshot(&self) -> Result<(), MemoryError> {
         let recorder = self
             .recorder
@@ -203,7 +206,60 @@ impl AgentSession {
             "state": self.state().as_str(),
             "transcript": transcript.iter().map(chat_message_to_json).collect::<Vec<_>>(),
         });
-        recorder.record(payload)
+        recorder
+            .lock()
+            .unwrap()
+            .record(&payload)
+            .map_err(|e| MemoryError::BackendUnavailable(e.to_string()))
+    }
+
+    /// Recover a session from a persisted JSONL log (FR-5 / M-3): read every
+    /// complete record from `<sessions_dir>/<id>.jsonl`, rebuild the
+    /// transcript, and return the session already in the `Resumed` state so
+    /// the loop can continue where it left off (task #79).
+    pub fn recover(
+        sessions_dir: &std::path::Path,
+        session_id: &str,
+        loop_: Arc<AgentLoop>,
+        memory: Arc<SharedMemoryStore>,
+    ) -> Result<Self, MemoryError> {
+        let path = sessions_dir.join(format!("{session_id}.jsonl"));
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            MemoryError::BackendUnavailable(format!("cannot read {}: {e}", path.display()))
+        })?;
+        let mut transcript = Vec::new();
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(value) => {
+                    // Snapshot payloads embed a transcript array; per-turn
+                    // records (user_prompt / step kinds) map directly.
+                    if let Some(entries) = value.get("transcript").and_then(|v| v.as_array()) {
+                        for e in entries {
+                            if let Some(msg) = chat_message_from_json(e) {
+                                transcript.push(msg);
+                            }
+                        }
+                    } else if let Some(msg) = chat_message_from_json(&value) {
+                        transcript.push(msg);
+                    }
+                }
+                Err(_) => continue, // truncated / malformed line: skip (M-3)
+            }
+        }
+        let session = Self::new(session_id, loop_, memory);
+        // Recovery enters the running state with the rebuilt transcript.
+        session
+            .resume()
+            .map_err(|e| MemoryError::BackendUnavailable(e.to_string()))?;
+        {
+            let mut tr = session.transcript.lock().unwrap();
+            *tr = transcript;
+        }
+        Ok(session)
     }
 
     // -- state machine transitions --------------------------------------------
@@ -237,11 +293,21 @@ impl AgentSession {
         restore_transcript: Vec<ChatMessage>,
     ) -> Result<(), SessionTransitionError> {
         let mut state = self.state.lock().unwrap();
+        // Only a New or Paused session may rebuild its transcript wholesale.
+        // A Resumed session would silently wipe live state (task #79); a
+        // Closed session is terminal.
         if matches!(*state, SessionState::Closed) {
             return Err(SessionTransitionError::new(
                 *state,
                 SessionState::Resumed,
                 "a closed session cannot be resumed",
+            ));
+        }
+        if matches!(*state, SessionState::Resumed) {
+            return Err(SessionTransitionError::new(
+                *state,
+                SessionState::Resumed,
+                "a running session cannot resume from a snapshot; pause it first",
             ));
         }
         let mut tr = self.transcript.lock().unwrap();
@@ -300,6 +366,37 @@ impl AgentSession {
 
     pub fn memory(&self) -> &Arc<SharedMemoryStore> {
         &self.memory
+    }
+}
+
+/// Inverse of [`chat_message_to_json`] for a single turn: accepts either the
+/// snapshot form `{"role": ..., "text": ...}` or the session-log forms
+/// `{"kind": "user_prompt", "text": ...}` / `{"kind": "step", "step": {...}}`.
+fn chat_message_from_json(value: &serde_json::Value) -> Option<ChatMessage> {
+    // Snapshot / plain form.
+    if let (Some(role), Some(text)) = (
+        value.get("role").and_then(|v| v.as_str()),
+        value.get("text").and_then(|v| v.as_str()),
+    ) {
+        return match role {
+            "user" => Some(ChatMessage::User(text.to_owned())),
+            "assistant" => Some(ChatMessage::Assistant(text.to_owned())),
+            _ => None,
+        };
+    }
+    // Session-log form: user_prompt records map directly.
+    match value.get("kind").and_then(|v| v.as_str())? {
+        "user_prompt" => Some(ChatMessage::User(value.get("text")?.as_str()?.to_owned())),
+        "step" => {
+            let step = value.get("step")?;
+            Some(ChatMessage::Assistant(
+                step.get("observation")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -427,5 +524,92 @@ mod tests {
         let s = build_session("s8");
         // No recorder attached via `new`, so persistence degrades cleanly.
         assert!(s.persist_snapshot().is_err());
+    }
+
+    /// Task #79 acceptance 1: persist_snapshot writes to the real file, and
+    /// AgentSession::recover rebuilds the identical transcript after a
+    /// simulated process restart (FR-5 / M-3).
+    #[tokio::test]
+    async fn persist_then_recover_rebuilds_identical_transcript() {
+        let dir = std::env::temp_dir().join(format!("webai-agent-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let llm = Arc::new(LlmClient::with_profile_stub("stub"));
+        let mem = Arc::new(SharedMemoryStore::new());
+        let loop_ = Arc::new(AgentLoop::new(Arc::clone(&llm), Arc::clone(&mem), vec![]));
+
+        // Process "run 1": create with a real recorder, push turns, persist.
+        {
+            let s = AgentSession::create(
+                "recover-1",
+                Arc::clone(&loop_),
+                Arc::clone(&mem),
+                SessionOptions {
+                    sessions_dir: dir.clone(),
+                    enable_jsonl: true,
+                },
+            )
+            .unwrap();
+            s.resume().unwrap();
+            s.push(ChatMessage::User("打开新浪财经".into()));
+            s.push(ChatMessage::Assistant("已导航".into()));
+            s.persist_snapshot().unwrap();
+            // Session drops here (simulating process exit).
+        }
+
+        // Process "run 2": recover from the persisted log.
+        let s2 =
+            AgentSession::recover(&dir, "recover-1", Arc::clone(&loop_), Arc::clone(&mem)).unwrap();
+        assert_eq!(s2.state(), SessionState::Resumed);
+        let tr = s2.transcript();
+        assert_eq!(tr.len(), 2);
+        assert!(matches!(tr[0], ChatMessage::User(ref t) if t == "打开新浪财经"));
+        assert!(matches!(tr[1], ChatMessage::Assistant(ref t) if t == "已导航"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Task #79 acceptance 2: a Resumed session must refuse a wholesale
+    /// transcript rebuild with a structured error (never silently wipe).
+    #[test]
+    fn resume_from_snapshot_on_running_session_is_rejected() {
+        let s = build_session("s-guard");
+        s.resume().unwrap();
+        let err = s
+            .resume_from_snapshot(vec![ChatMessage::User("wipe".into())])
+            .unwrap_err();
+        assert_eq!(err.code(), "session_illegal_transition");
+        assert!(err.message.contains("pause it first"), "got: {err}");
+        // The live transcript is untouched.
+        assert!(s.transcript().is_empty());
+    }
+
+    /// Recovery tolerates a truncated trailing line (kill -9 mid-write).
+    #[tokio::test]
+    async fn recover_skips_truncated_trailing_line() {
+        let dir = std::env::temp_dir().join(format!("webai-agent-recover2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("recover-2.jsonl"),
+            "{\"session_id\":\"recover-2\",\"state\":\"running\",\"transcript\":[{\"role\":\"user\",\"text\":\"a\"}]}\n{\"trunc",
+        )
+        .unwrap();
+
+        let llm = Arc::new(LlmClient::with_profile_stub("stub"));
+        let s = AgentSession::recover(
+            &dir,
+            "recover-2",
+            Arc::new(AgentLoop::new(
+                llm,
+                Arc::new(SharedMemoryStore::new()),
+                vec![],
+            )),
+            Arc::new(SharedMemoryStore::new()),
+        )
+        .unwrap();
+        assert_eq!(s.state(), SessionState::Resumed);
+        assert_eq!(s.transcript().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

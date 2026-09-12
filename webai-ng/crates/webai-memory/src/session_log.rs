@@ -147,13 +147,15 @@ pub fn recovery_from_persisted_step(path: &Path) -> Vec<Json> {
 mod tests {
     use super::*;
 
-    fn temp_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("webai-jsonl-{}", std::process::id()))
+    /// Unique per test (name + pid) so parallel tests that remove their
+    /// directory cannot delete another test's log mid-run.
+    fn temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("webai-jsonl-{name}-{}", std::process::id()))
     }
 
     #[test]
     fn write_flush_is_immediately_visible() {
-        let dir = temp_dir();
+        let dir = temp_dir("write_flush");
         let mut log = JsonlSessionLog::open(&dir, "s1").unwrap();
         log.record_user_prompt("hello").unwrap();
         // After record (which flushes), the file must contain the line.
@@ -165,7 +167,7 @@ mod tests {
 
     #[test]
     fn record_all_kinds_writes_lines() {
-        let dir = temp_dir();
+        let dir = temp_dir("all_kinds");
         let mut log = JsonlSessionLog::open(&dir, "s2").unwrap();
         log.record_user_prompt("hi").unwrap();
         log.record_step(&serde_json::json!({ "tool": "browser.click" }))
@@ -179,7 +181,7 @@ mod tests {
 
     #[test]
     fn recovery_drops_trailing_truncated_line() {
-        let dir = temp_dir();
+        let dir = temp_dir("recovery_trunc");
         let path = dir.join("s3.jsonl");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -194,7 +196,7 @@ mod tests {
 
     #[test]
     fn recovery_skips_bad_middle_line() {
-        let dir = temp_dir();
+        let dir = temp_dir("recovery_mid");
         let path = dir.join("s4.jsonl");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -213,7 +215,7 @@ mod tests {
 
     #[test]
     fn recovery_empty_or_missing_file_returns_empty() {
-        let dir = temp_dir();
+        let dir = temp_dir("recovery_empty");
         let path = dir.join("missing.jsonl");
         assert!(recovery_from_persisted_step(&path).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
