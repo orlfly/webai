@@ -8,6 +8,10 @@ license.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# Passthrough enabling the C++ cog/WPE FFI wrapper; default build is pure Rust.
+legacy_cpp = ["webai-bridge-cxx/legacy_cpp"]
+
 [dependencies]
 webai-protocol = { path = "../webai-protocol" }
 webai-bridge-cxx = { path = "../webai-bridge-cxx" }
