@@ -9,6 +9,7 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+webai-config = { path = "../webai-config" }
 webai-protocol = { path = "../webai-protocol" }
 webai-bridge = { path = "../webai-bridge" }
 webai-llm = { path = "../webai-llm" }
