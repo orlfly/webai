@@ -40,12 +40,21 @@
 - **实测值**：0 例穿越/覆盖；静态走查：所有路径拼接必经校验函数。
 - **状态**：过门（release blocker 维度：0 例）。
 
-### M-6 资源：单会话空闲内存 — 阈值 <300MB — ⏳ CI 产出（机制就绪）
+### M-6 资源：单会话空闲内存 — 阈值 <300MB — ⏳ 实测机制认证（数值以 CI rss_gate 为准）
 
-- **口径**：1 会话 + 1 WebKit 视图已加载基准页，RSS 每 5s 采样取空闲稳定均值，排除 LLM 进程；static/spa 两 fixture 取较大值。
-- **数据来源**：`scripts/rss_sample.py`（procfs 采样 + 阈值断言）+ CI `rss_gate` job（WPE 镜像内 release 构建，static/spa 各一次）+ `rss_budget_crosscheck.py`（4 会话 × 300MB = 1200MB ≤ §6.1 池预算 1250MB）。
-- **实测值**：交叉验证 PASS（1200 ≤ 1250）；逐 fixture RSS 数值由 `rss_gate` CI job 首跑产出报表（阈值断言超限即 fail）。
-- **状态**：机制过门；数值以 CI 报表为准。**若首跑超 300MB：blocker，整改建议 = 降低 view 常驻（§6.1 进程外视图 / 更激进回收），并在 PR 中复测。**
+> 评审 #71 Major-1：本节已**基于含 `headless-resident-mode` 的集成树**重写。早前报告的 "1200 ≤ 1250" 是常量 tautology（300×4），且 bin 无 `--resident-secs`、`rss_sample` 全链路会报 "no VmRSS for pid"。现用**实测 RSS_AVG_MB** 喂 crosscheck，非字面常量。
+
+- **口径**：1 会话 + 1 WebKit 视图已加载基准页（static/spa 取较大值），RSS 每 5s 采样取空闲稳定均值，排除 LLM 进程。
+- **数据来源（集成树，均已 merge 到本报告所在集成分支）**：
+  - `bins/webai` `--headless --resident-secs <n>`：prompt 完成后进程常驻 n 秒供采样（Blocker-1 已修）；
+  - `scripts/rss_sample.py`：procfs 采样 + `RSS_AVG_MB` 输出 + 阈值断言；
+  - `rss_budget_crosscheck.py`：从 stdin 消费实测 `RSS_AVG_MB`（无常量 tautology；无输入 exit 2）；
+  - CI `rss_gate` job：WPE 镜像内 release 构建，static/spa 各一次，取较大值 pipe 进 crosscheck。
+- **实测认证（本集成树实跑）**：
+  - 常驻流程验证：`webai --headless --prompt navigate --resident-secs 6` 进程存活可读 VmRSS、退出码 0；
+  - 测量→crosscheck 全链路：stub（无 WebKit 视图）实测 RSS_AVG_MB=3.4 → crosscheck PASS（PROJECTED=14 ≤ 1250）；
+  - **含 WebKit 视图的数值须由 CI `rss_gate` 首跑产出**（本沙箱无 WPE 设备）；阈值断言超限即 fail。
+- **状态**：机制与实测链路认证通过；M-6 数值以合并后 main 的 CI `rss_gate` 报表为准。**若首跑超 300MB：blocker，整改建议 = 降低 view 常驻（§6.1 进程外视图 / 更激进回收），并在 PR 中复测。**
 
 ## 2. 兼容性回归（§11）
 
@@ -67,5 +76,5 @@
 ## 4. 结论
 
 - **M-1/M-2/M-3/M-4/M-5：过门。**
-- **M-6：机制与门禁断言就绪**（采样脚本 + CI 阈值 + 预算交叉验证全 PASS），数值由 CI 报表闭环；若超阈值按 §3 登记为 blocker 并按建议整改。
+- **M-6：实测链路认证通过**（集成树 `--resident-secs` + 实测 RSS_AVG_MB 喂 crosscheck，非常量 tautology；stub 实测 3.4MB → PASS），含 WebKit 视图的数值以合并后 main 的 CI `rss_gate` 报表闭环；若超阈值按 §3 登记为 blocker 并按建议整改。
 - v0.4 可在 `rss_gate` 首跑 PASS 后正式打 release tag。
