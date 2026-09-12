@@ -19,7 +19,12 @@ use std::sync::{Arc, Mutex};
 
 use webai_bridge_cxx::{BridgeCxxError, LoadFinished, WebkitBridgeCxx};
 
+pub mod bundle;
 pub mod pool;
+
+pub use bundle::{
+    concat_bundle, self_check, verify_order, BundleError, BundleReport, BUNDLE_SOURCES,
+};
 
 /// Ordered list of page-side bundle scripts (ARCHITECTURE.md §4.6). Order is
 /// significant and must be preserved exactly.
@@ -43,85 +48,19 @@ pub const BUNDLE_SCRIPT_ORDER: &[&str] = &[
 
 /// Fetch the source of a page-bundle script by its `BUNDLE_SCRIPT_ORDER` path.
 ///
-/// Returns `None` if the path is not a known bundle entry. The content is
-/// embedded at compile time, so this never touches the filesystem at runtime.
+/// Single fact source: reads the embedded [`BUNDLE_SOURCES`] table (see
+/// `bundle`), so there is exactly one copy of each module in the binary.
+/// Returns `None` if the path is not a known bundle entry.
 pub fn bundle_script(path: &str) -> Option<&'static str> {
-    if !BUNDLE_SCRIPT_ORDER.contains(&path) {
-        return None;
-    }
-    Some(match path {
-        "bridge-client.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/bridge-client.js"
-        )),
-        "parser/index.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/parser/index.js"
-        )),
-        "accessibility/index.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/accessibility/index.js"
-        )),
-        "dom.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/dom.js"
-        )),
-        "selector.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/selector.js"
-        )),
-        "events.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/events.js"
-        )),
-        "network.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/network.js"
-        )),
-        "storage.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/storage.js"
-        )),
-        "actions/navigate.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/actions/navigate.js"
-        )),
-        "actions/history.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/actions/history.js"
-        )),
-        "actions/interact.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/actions/interact.js"
-        )),
-        "actions/extract.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/actions/extract.js"
-        )),
-        "actions/screenshot.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/actions/screenshot.js"
-        )),
-        "actions/composite.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/actions/composite.js"
-        )),
-        "legacy/playwright-shim.js" => include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../page-bundle/legacy/playwright-shim.js"
-        )),
-        _ => unreachable!("BUNDLE_SCRIPT_ORDER membership already checked"),
-    })
+    BUNDLE_SOURCES
+        .iter()
+        .find(|(name, _)| *name == path)
+        .map(|(_, src)| *src)
 }
 
 /// Iterate the full bundle in `BUNDLE_SCRIPT_ORDER`, yielding `(path, source)`.
 pub fn bundle_scripts() -> impl Iterator<Item = (&'static str, &'static str)> {
-    BUNDLE_SCRIPT_ORDER.iter().map(|path| {
-        (
-            *path,
-            bundle_script(path).expect("bundle entry must have embedded source"),
-        )
-    })
+    BUNDLE_SOURCES.iter().map(|(name, src)| (*name, *src))
 }
 
 /// WebKit bridge errors (ARCHITECTURE.md §7).
@@ -288,9 +227,7 @@ impl WebkitBridge {
                 .get("error")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    format!("script failed with no error detail: {parsed}")
-                });
+                .unwrap_or_else(|| format!("script failed with no error detail: {parsed}"));
             return Err(WebkitError::ScriptError(msg));
         }
         let json = parsed
