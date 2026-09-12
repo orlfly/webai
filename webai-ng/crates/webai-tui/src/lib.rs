@@ -9,6 +9,7 @@
 
 pub mod app;
 pub mod images;
+pub mod run;
 pub mod session;
 
 pub use app::{App, ChatLine, KeyAction, PAGE_ROWS, RENDER_TICK_MS};
@@ -16,6 +17,7 @@ pub use images::{
     detect_protocol, DispatchOutcome, ImagePipeline, ImageProtocol, IngestedImage,
     PlaceholderReason,
 };
+pub use run::{install_panic_hook, run, run_real, LoopSignal, TerminalGuard};
 pub use session::{PromptHandler, SessionBackend, COALESCE_STEP_BURST, EVENT_CHANNEL_CAPACITY};
 
 /// A command the frontend sends to the session background task.
