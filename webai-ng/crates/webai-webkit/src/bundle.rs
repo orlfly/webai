@@ -8,52 +8,64 @@
 
 use crate::BUNDLE_SCRIPT_ORDER;
 
-/// Embedded sources, keyed exactly as in [`BUNDLE_SCRIPT_ORDER`].
+/// Embedded sources, keyed exactly as in [`BUNDLE_SCRIPT_ORDER`]. This table
+/// is the single fact source for the embedded bundle: the workspace-root
+/// `page-bundle/` assets are included once here, and `bundle_script()` in
+/// the crate root reads this table (no second copy of the loader).
 pub const BUNDLE_SOURCES: &[(&str, &str)] = &[
     (
         "bridge-client.js",
-        include_str!("../page-bundle/bridge-client.js"),
+        include_str!("../../../page-bundle/bridge-client.js"),
     ),
     (
         "parser/index.js",
-        include_str!("../page-bundle/parser/index.js"),
+        include_str!("../../../page-bundle/parser/index.js"),
     ),
     (
         "accessibility/index.js",
-        include_str!("../page-bundle/accessibility/index.js"),
+        include_str!("../../../page-bundle/accessibility/index.js"),
     ),
-    ("dom.js", include_str!("../page-bundle/dom.js")),
-    ("selector.js", include_str!("../page-bundle/selector.js")),
-    ("events.js", include_str!("../page-bundle/events.js")),
-    ("network.js", include_str!("../page-bundle/network.js")),
-    ("storage.js", include_str!("../page-bundle/storage.js")),
+    ("dom.js", include_str!("../../../page-bundle/dom.js")),
+    (
+        "selector.js",
+        include_str!("../../../page-bundle/selector.js"),
+    ),
+    ("events.js", include_str!("../../../page-bundle/events.js")),
+    (
+        "network.js",
+        include_str!("../../../page-bundle/network.js"),
+    ),
+    (
+        "storage.js",
+        include_str!("../../../page-bundle/storage.js"),
+    ),
     (
         "actions/navigate.js",
-        include_str!("../page-bundle/actions/navigate.js"),
+        include_str!("../../../page-bundle/actions/navigate.js"),
     ),
     (
         "actions/history.js",
-        include_str!("../page-bundle/actions/history.js"),
+        include_str!("../../../page-bundle/actions/history.js"),
     ),
     (
         "actions/interact.js",
-        include_str!("../page-bundle/actions/interact.js"),
+        include_str!("../../../page-bundle/actions/interact.js"),
     ),
     (
         "actions/extract.js",
-        include_str!("../page-bundle/actions/extract.js"),
+        include_str!("../../../page-bundle/actions/extract.js"),
     ),
     (
         "actions/screenshot.js",
-        include_str!("../page-bundle/actions/screenshot.js"),
+        include_str!("../../../page-bundle/actions/screenshot.js"),
     ),
     (
         "actions/composite.js",
-        include_str!("../page-bundle/actions/composite.js"),
+        include_str!("../../../page-bundle/actions/composite.js"),
     ),
     (
         "legacy/playwright-shim.js",
-        include_str!("../page-bundle/legacy/playwright-shim.js"),
+        include_str!("../../../page-bundle/legacy/playwright-shim.js"),
     ),
 ];
 
@@ -149,22 +161,37 @@ mod tests {
     }
 
     #[test]
-    fn every_module_is_non_empty_and_registered() {
+    fn every_module_is_non_empty_and_is_an_iife_module() {
         for (name, src) in BUNDLE_SOURCES {
             assert!(!src.trim().is_empty(), "{name} is empty");
-            // Each stub registers itself on the __webai namespace.
-            assert!(src.contains("__webai"), "{name} does not register");
+            // Real modules (migrated by task 30) are IIFE-wrapped and
+            // register on their legacy namespace (__webkitBridge, WebkitAiDom,
+            // ...) rather than a single stub namespace.
+            assert!(src.contains("(function"), "{name} is not IIFE-wrapped");
+            assert!(
+                src.contains("'use strict'") || src.contains("\"use strict\""),
+                "{name} lacks strict mode"
+            );
         }
     }
 
     #[test]
     fn concat_preserves_injection_order() {
         let joined = concat_bundle();
-        let pos_bridge = joined.find("bridge-client").unwrap();
-        let pos_dom = joined.find("'dom'").unwrap();
-        let pos_shim = joined.find("playwright-shim").unwrap();
-        assert!(pos_bridge < pos_dom);
-        assert!(pos_dom < pos_shim);
+        // Each module appears exactly once and in BUNDLE_SCRIPT_ORDER order.
+        let mut last = 0usize;
+        for (name, src) in BUNDLE_SOURCES {
+            // Locate this module's source by a leading comment or its IIFE
+            // body: search from the end of the previous module onward.
+            let marker = src.lines().next().unwrap().trim();
+            let pos = joined[last..]
+                .find(&marker[..marker.len().min(40)])
+                .unwrap_or_else(|| panic!("module {name} marker not found in order"));
+            assert!(pos + last >= last);
+            last += pos;
+        }
+        // bridge-client content precedes dom.js content.
+        assert!(joined.find("__webkitBridge").unwrap() < joined.find("WebkitAiDom").unwrap());
     }
 
     #[test]

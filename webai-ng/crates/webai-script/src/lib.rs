@@ -50,10 +50,18 @@ pub fn compose(request: &BrowserToolRequest) -> Result<ScriptModule, ScriptError
                 args: request.args.to_string(),
             })
         }
-        BrowserVerb::Navigate | BrowserVerb::Click | BrowserVerb::Fill | BrowserVerb::Hover
-        | BrowserVerb::Drag | BrowserVerb::PressKey | BrowserVerb::Screenshot
-        | BrowserVerb::AccessibilityTree | BrowserVerb::GetText | BrowserVerb::GetHtml
-        | BrowserVerb::Download | BrowserVerb::Snapshot => Ok(stub_module(&request.verb, &request.args)),
+        BrowserVerb::Navigate
+        | BrowserVerb::Click
+        | BrowserVerb::Fill
+        | BrowserVerb::Hover
+        | BrowserVerb::Drag
+        | BrowserVerb::PressKey
+        | BrowserVerb::Screenshot
+        | BrowserVerb::AccessibilityTree
+        | BrowserVerb::GetText
+        | BrowserVerb::GetHtml
+        | BrowserVerb::Download
+        | BrowserVerb::Snapshot => Ok(stub_module(&request.verb, &request.args)),
     }
 }
 
@@ -104,8 +112,8 @@ fn base64(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webai_protocol::BrowserVerb;
     use serde_json::json;
+    use webai_protocol::BrowserVerb;
 
     #[test]
     fn evaluate_composes_module_and_roundtrips_script() {
@@ -127,7 +135,10 @@ mod tests {
             verb: BrowserVerb::Evaluate,
             args: json!({}),
         };
-        assert!(matches!(compose(&req), Err(ScriptError::MissingArg("script", BrowserVerb::Evaluate))));
+        assert!(matches!(
+            compose(&req),
+            Err(ScriptError::MissingArg("script", BrowserVerb::Evaluate))
+        ));
     }
 
     #[test]
@@ -152,7 +163,9 @@ mod tests {
                 args: json!({}),
             };
             let m = compose(&req).expect("stub compose must not fail");
-            assert!(m.execute_src.contains(&format!("\"{}\"", verb.canonical_name())));
+            assert!(m
+                .execute_src
+                .contains(&format!("\"{}\"", verb.canonical_name())));
         }
     }
 

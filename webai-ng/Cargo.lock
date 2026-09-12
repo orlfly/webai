@@ -2152,6 +2152,7 @@ dependencies = [
  "webai-agent",
  "webai-config",
  "webai-tui",
+ "webai-webkit",
 ]
 
 [[package]]
