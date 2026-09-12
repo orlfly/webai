@@ -9,6 +9,12 @@
 
 use std::sync::{Arc, Mutex};
 
+pub mod bundle;
+
+pub use bundle::{
+    concat_bundle, self_check, verify_order, BundleError, BundleReport, BUNDLE_SOURCES,
+};
+
 /// Ordered list of page-side bundle scripts (ARCHITECTURE.md §4.6). Order is
 /// significant and must be preserved exactly.
 pub const BUNDLE_SCRIPT_ORDER: &[&str] = &[
@@ -172,7 +178,10 @@ mod tests {
             bridge.evaluate_javascript("1+1", 100).await,
             Err(WebkitError::CogLaunch(_))
         ));
-        assert!(matches!(bridge.screenshot().await, Err(WebkitError::CogLaunch(_))));
+        assert!(matches!(
+            bridge.screenshot().await,
+            Err(WebkitError::CogLaunch(_))
+        ));
         assert!(matches!(
             bridge.inject_user_script("x").await,
             Err(WebkitError::CogLaunch(_))
