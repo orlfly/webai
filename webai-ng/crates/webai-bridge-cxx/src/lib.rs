@@ -93,6 +93,10 @@ impl WebkitBridgeCxx {
 mod tests {
     use super::*;
 
+    // Rust-only (no legacy_cpp) builds surface the structured CogLaunch
+    // error; with the feature on, launch succeeds (that path has its own
+    // --ignored real-device smoke test).
+    #[cfg(not(feature = "legacy_cpp"))]
     #[test]
     fn default_build_returns_cog_launch_error_on_launch() {
         let mut bridge = WebkitBridgeCxx::default();
@@ -101,6 +105,14 @@ mod tests {
             BridgeCxxError::CogLaunch(msg) => assert!(!msg.is_empty()),
             other => panic!("expected CogLaunch, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "legacy_cpp")]
+    #[test]
+    fn legacy_cpp_build_launches_successfully() {
+        let mut bridge = WebkitBridgeCxx::default();
+        bridge.launch().expect("legacy_cpp launch must succeed");
+        assert!(bridge.is_launched());
     }
 
     #[test]
