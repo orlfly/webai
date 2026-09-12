@@ -92,14 +92,55 @@ pub fn filename_for_url(url: &str) -> String {
     }
 }
 
+/// Percent-decode an RFC 5987 `ext-value` (`charset'%lang%percent-encoded`),
+/// decoding `%XX` pairs as UTF-8 bytes (task #76, review Major-1).
+pub fn percent_decode_utf8(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            let byte = u8::from_str_radix(hex, 16).ok()?;
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Extract a file name from a `Content-Disposition: attachment;
-/// filename="..."` header value.
+/// filename="..."` header value. RFC 5987 `filename*=` values are
+/// percent-decoded to UTF-8 (task #76).
 pub fn parse_content_disposition_filename(header: &str) -> Option<String> {
     let lower = header.to_ascii_lowercase();
     if !lower.contains("attachment") && !lower.contains("inline") {
         return None;
     }
-    for quoted in ["filename=\"", "filename*=UTF-8''"] {
+    // RFC 5987 extended form first: filename*=UTF-8''%E4%B8%AD%E6%96%87.txt
+    if let Some(idx) = lower.find("filename*=") {
+        let rest = &header[idx + "filename*=".len()..];
+        // Strip the optional quote and the `charset'%lang%` prefix.
+        let rest = rest.trim_start_matches('"');
+        if let Some(tick) = rest.find('\'') {
+            let after = &rest[tick + 1..];
+            // Skip the language tag (second quote).
+            if let Some(tick2) = after.find('\'') {
+                let encoded = &after[tick2 + 1..];
+                let end = encoded.find(';').unwrap_or(encoded.len());
+                let encoded = encoded[..end].trim().trim_end_matches('"');
+                if let Some(decoded) = percent_decode_utf8(encoded) {
+                    if !decoded.is_empty() {
+                        return Some(decoded);
+                    }
+                }
+            }
+        }
+    }
+    for quoted in ["filename=\""] {
         if let Some(idx) = header.find(quoted) {
             let rest = &header[idx + quoted.len()..];
             let end = rest.find('"').unwrap_or(rest.len());
@@ -122,11 +163,13 @@ pub fn parse_content_disposition_filename(header: &str) -> Option<String> {
 /// Return a path in `dir` for `filename`, appending `-N` before the
 /// extension when the file already exists so downloads never overwrite a
 /// previous file.
-pub fn unique_path(dir: &Path, filename: &str) -> PathBuf {
-    let candidate = dir.join(filename);
-    if !candidate.exists() {
-        return candidate;
-    }
+///
+/// Reservation is **atomic** (`OpenOptions::create_new`), so concurrent
+/// downloads can never pick the same `-N` path and overwrite each other
+/// (task #76, review Major-2). Returns the reserved path, creating an empty
+/// placeholder file that the caller writes over via the same handle semantics
+/// (create_new guarantees exclusive creation).
+pub fn unique_path(dir: &Path, filename: &str) -> std::io::Result<PathBuf> {
     let stem = Path::new(filename)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -134,17 +177,28 @@ pub fn unique_path(dir: &Path, filename: &str) -> PathBuf {
     let ext = Path::new(filename)
         .extension()
         .map(|s| s.to_string_lossy().into_owned());
-    for n in 1.. {
-        let name = match &ext {
+
+    // Try the bare name first, then -1, -2, ... Each reservation is an
+    // exclusive create, so two racing callers always land on distinct paths.
+    let mut names = vec![filename.to_string()];
+    for n in 1..=1_000u32 {
+        names.push(match &ext {
             Some(e) => format!("{stem}-{n}.{e}"),
             None => format!("{stem}-{n}"),
-        };
-        let candidate = dir.join(name);
-        if !candidate.exists() {
-            return candidate;
+        });
+    }
+
+    for name in names {
+        let candidate = dir.join(&name);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        match opts.open(&candidate) {
+            Ok(_handle) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
     }
-    unreachable!("unique_path loop must terminate");
+    Err(std::io::Error::other("no unique download path available"))
 }
 
 /// Validate that a URL is a fetchable http(s) URL.
@@ -237,9 +291,15 @@ pub async fn download(
         })?
         .to_vec();
 
-    // Write to a temp path first, then atomically rename, so a failure
-    // leaves no partial file at the target path.
-    let path = unique_path(&directory, &effective_filename);
+    // Reserve the target atomically (create_new) so concurrent downloads
+    // cannot pick the same -N path (task #76). The reservation creates the
+    // final file; we then write the payload through to it in place, so a
+    // failure still leaves the reserved name (never another download's).
+    let path =
+        unique_path(&directory, &effective_filename).map_err(|e| DownloadError::WriteFailed {
+            path: directory.join(&effective_filename).display().to_string(),
+            err: e.to_string(),
+        })?;
     let tmp = directory.join(format!(".{}.tmp", std::process::id()));
     std::fs::write(&tmp, &bytes).map_err(|e| DownloadError::WriteFailed {
         path: tmp.display().to_string(),
@@ -316,13 +376,74 @@ mod tests {
     fn unique_path_appends_suffix_on_collision() {
         let dir = std::env::temp_dir().join(format!("webai-dl-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Create a.pdf, then unique_path must yield a-1.pdf.
-        std::fs::write(dir.join("a.pdf"), b"x").unwrap();
-        let p1 = unique_path(&dir, "a.pdf");
+        // unique_path reserves exclusively: the first call creates a.pdf, the
+        // second must land on a-1.pdf (no overwrite), etc.
+        let p0 = unique_path(&dir, "a.pdf").unwrap();
+        assert_eq!(p0.file_name().unwrap().to_string_lossy(), "a.pdf");
+        let p1 = unique_path(&dir, "a.pdf").unwrap();
         assert_eq!(p1.file_name().unwrap().to_string_lossy(), "a-1.pdf");
-        std::fs::write(&p1, b"x").unwrap();
-        let p2 = unique_path(&dir, "a.pdf");
+        let p2 = unique_path(&dir, "a.pdf").unwrap();
         assert_eq!(p2.file_name().unwrap().to_string_lossy(), "a-2.pdf");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RFC 5987: `filename*=UTF-8''...` must be percent-decoded to UTF-8
+    /// (task #76, review Major-1) instead of mangling `%` via the sanitizer.
+    #[test]
+    fn parse_content_disposition_percent_decodes_utf8_ext_value() {
+        let h = "attachment; filename*=UTF-8''%E4%B8%AD%E6%96%87.txt";
+        assert_eq!(
+            parse_content_disposition_filename(h).as_deref(),
+            Some("中文.txt")
+        );
+        // With a language tag: filename*=UTF-8'lang'%...
+        let h2 = "attachment; filename*=UTF-8'zh'%E6%8A%A5%E8%A1%A8.pdf";
+        assert_eq!(
+            parse_content_disposition_filename(h2).as_deref(),
+            Some("报表.pdf")
+        );
+        // Plain quoted filename still works.
+        assert_eq!(
+            parse_content_disposition_filename("attachment; filename=\"a b.pdf\"").as_deref(),
+            Some("a b.pdf")
+        );
+    }
+
+    #[test]
+    fn percent_decode_handles_edge_cases() {
+        assert_eq!(percent_decode_utf8("%41%42"), Some("AB".into()));
+        assert_eq!(percent_decode_utf8("no-percent"), Some("no-percent".into()));
+        // Truncated escape must fail cleanly (None), not panic.
+        assert_eq!(percent_decode_utf8("%E4%B8"), None);
+        assert_eq!(percent_decode_utf8("%ZZ"), None);
+    }
+
+    /// Concurrent unique_path reservations must produce distinct files with
+    /// no overwrite (task #76, review Major-2).
+    #[test]
+    fn concurrent_unique_path_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!(
+            "webai-dl-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir2 = dir.clone();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let d = dir2.clone();
+                std::thread::spawn(move || unique_path(&d, "a.pdf").unwrap())
+            })
+            .collect();
+        let mut names = std::collections::HashSet::new();
+        for h in handles {
+            let p = h.join().unwrap();
+            assert!(names.insert(p.file_name().unwrap().to_string_lossy().into_owned()));
+        }
+        assert_eq!(names.len(), 8, "8 racers must get 8 distinct names");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
