@@ -9,8 +9,10 @@ use std::sync::Arc;
 
 use webai_agent::AgentSession;
 
+pub mod encoders;
 pub mod images;
 
+pub use encoders::{encode_frame, visible_ids, EncodedFrame};
 pub use images::{
     detect_protocol, DispatchOutcome, ImagePipeline, ImageProtocol, IngestedImage,
     PlaceholderReason,
