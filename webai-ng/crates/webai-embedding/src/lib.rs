@@ -83,6 +83,9 @@ impl Default for BgeM3Config {
 pub struct BgeM3Adapter {
     config: BgeM3Config,
     client: reqwest::Client,
+    /// Set by [`BgeM3Adapter::degraded`]: every embed call then returns
+    /// `BackendUnavailable` instead of a silent placeholder (task #74).
+    degraded: bool,
 }
 
 impl BgeM3Adapter {
@@ -95,6 +98,7 @@ impl BgeM3Adapter {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_default(),
+            degraded: false,
         }
     }
 
@@ -105,6 +109,7 @@ impl BgeM3Adapter {
         Self {
             config: BgeM3Config::default(),
             client: reqwest::Client::new(),
+            degraded: true,
         }
     }
 
@@ -187,6 +192,13 @@ impl BgeM3Adapter {
 #[async_trait]
 impl EmbeddingModel for BgeM3Adapter {
     async fn embed(&self, text: &str) -> Result<Embedding, EmbeddingError> {
+        // Degraded construction (missing embd.toml / no backend) is an
+        // explicit signal, never a silent placeholder (task #74).
+        if self.degraded {
+            return Err(EmbeddingError::BackendUnavailable(
+                "embedding adapter is degraded (no vector model configured)".into(),
+            ));
+        }
         if self.config.endpoint.is_some() {
             let mut batch = self.remote_embed(&[text]).await?;
             return batch
@@ -197,6 +209,11 @@ impl EmbeddingModel for BgeM3Adapter {
     }
 
     async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Embedding>, EmbeddingError> {
+        if self.degraded {
+            return Err(EmbeddingError::BackendUnavailable(
+                "embedding adapter is degraded (no vector model configured)".into(),
+            ));
+        }
         if self.config.endpoint.is_some() {
             return self.remote_embed(texts).await;
         }
@@ -253,12 +270,22 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_adapter_reports_backend_unavailable() {
-        // A degraded adapter with no endpoint returns a structured error.
+        // Degraded construction must yield an explicit BackendUnavailable on
+        // every call, never a panic or a silent placeholder vector (#74).
         let m = BgeM3Adapter::degraded();
         assert!(!m.is_available());
-        // With no endpoint, the stub path returns a placeholder (not an error).
-        // To test the unavailable signal, we check is_available() is false.
-        assert!(!m.is_available());
+
+        let err = m.embed("any text").await.unwrap_err();
+        assert!(
+            matches!(err, EmbeddingError::BackendUnavailable(_)),
+            "embed must report BackendUnavailable, got {err:?}"
+        );
+
+        let batch_err = m.embed_batch(&["a", "b"]).await.unwrap_err();
+        assert!(
+            matches!(batch_err, EmbeddingError::BackendUnavailable(_)),
+            "embed_batch must report BackendUnavailable, got {batch_err:?}"
+        );
     }
 
     #[tokio::test]
