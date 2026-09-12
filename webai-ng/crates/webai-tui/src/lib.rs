@@ -18,7 +18,9 @@ pub use images::{
     PlaceholderReason,
 };
 pub use run::{install_panic_hook, run, run_real, LoopSignal, TerminalGuard};
-pub use session::{PromptHandler, SessionBackend, COALESCE_STEP_BURST, EVENT_CHANNEL_CAPACITY};
+pub use session::{
+    LoopPromptHandler, PromptHandler, SessionBackend, COALESCE_STEP_BURST, EVENT_CHANNEL_CAPACITY,
+};
 
 /// A command the frontend sends to the session background task.
 #[derive(Debug, Clone)]

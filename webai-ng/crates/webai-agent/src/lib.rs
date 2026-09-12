@@ -11,6 +11,8 @@ use webai_llm::LlmClient;
 use webai_memory::SharedMemoryStore;
 
 pub mod plan_loop;
+pub mod runner;
+pub mod runtime;
 pub mod sandbox;
 pub mod script_memory;
 pub mod session;
@@ -18,6 +20,13 @@ pub mod summariser;
 pub mod tools;
 
 pub use plan_loop::{requires_plan, LoopError, LoopGuards, PLAN_DIRECTIVE, STATE_BLOCK_MARKER};
+pub use runner::{
+    outcome_code, AgentRunner, AgentStep, RunConfig, StepOutcome, StubExecutor, ToolExecutor,
+};
+pub use runtime::{
+    bootstrap, build_agent_loop, check_public_gate, launch, memory_store, resume_transcript,
+    scan_sessions, LaunchHooks, LaunchMode, LaunchOutcome, Runtime, RuntimeError,
+};
 pub use sandbox::{PathSandbox, SandboxError};
 pub use script_memory::{RepairError, ReuseHit, ScriptMemory};
 pub use session::{AgentSession, SessionOptions, SessionState};

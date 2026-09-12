@@ -2149,6 +2149,7 @@ dependencies = [
 name = "webai"
 version = "0.1.0"
 dependencies = [
+ "tokio",
  "webai-acp",
  "webai-agent",
  "webai-config",
@@ -2187,6 +2188,7 @@ dependencies = [
  "tokio",
  "tracing",
  "webai-bridge",
+ "webai-config",
  "webai-llm",
  "webai-memory",
  "webai-protocol",
