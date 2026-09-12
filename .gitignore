@@ -5,3 +5,4 @@ AGENTS.md
 
 # Download test artifacts
 webai-ng/crates/webai-bridge/downloads/
+webai-ng/crates/webai-agent/.webai/
