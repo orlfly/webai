@@ -401,19 +401,75 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_profile_fails_fast() {
-        // A stub client with no real provider returns a Provider error on
-        // chat_stream (no silent fallback to a default key).
-        let client = LlmClient::with_profile_stub("stub");
-        let messages = [ChatMessage::Text(ChatRole::User, "hi".into())];
-        let result = client.chat_stream(&messages).await;
-        assert!(result.is_err(), "must not silently succeed");
+        // The real fast-fail path: `with_profile` on a profile that is not in
+        // the config must return `UnknownProfile` without any LLM call.
+        let dir = std::env::temp_dir().join(format!("webai-llm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("llm.toml"),
+            "[cloud]\nmodel = \"test\"\nbase_url = \"http://localhost:9\"\nendpoint = \"/v1/chat/completions\"\napi_key = \"k\"\n",
+        )
+        .unwrap();
+        std::env::set_var("WEBAI_CONFIG", &dir);
+        let err = match LlmClient::with_profile("ghost").await {
+            Ok(_) => panic!("ghost profile must not resolve"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, LlmError::UnknownProfile(ref p) if p == "ghost"));
     }
 
-    #[test]
-    fn retry_backoff_sequence_is_0_5_1_2_seconds() {
-        // The backoff schedule is [500, 1000, 2000] ms.
-        let schedule = [500u64, 1000, 2000];
-        assert_eq!(schedule.len(), 3);
-        assert_eq!(schedule, [500, 1000, 2000]);
+    // A client whose only profile points at a closed local port: every
+    // `complete_once` fails with a Provider error, forcing the real retry
+    // path in `chat_stream`.
+    fn retry_client() -> LlmClient {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "down".into(),
+            LlmProfile {
+                model: "test".into(),
+                // Port 9 (discard) is never serving HTTP in the test env.
+                base_url: "http://127.0.0.1:9".into(),
+                endpoint: "/v1/chat/completions".into(),
+                api_key: "k".into(),
+                timeout_ms: 1_000,
+            },
+        );
+        LlmClient {
+            profile: "down".into(),
+            profiles,
+            http: reqwest::Client::new(),
+            #[cfg(test)]
+            scripted: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_backoff_waits_500_1000_2000ms_then_fails() {
+        // Auto-advance paused time; `Instant::now` on the paused clock
+        // measures the virtual elapsed backoff exactly.
+        let start = tokio::time::Instant::now();
+        let client = retry_client();
+        let messages = [ChatMessage::Text(ChatRole::User, "hi".into())];
+        let result = match client.chat_stream(&messages).await {
+            Ok(_) => panic!("expected failure against a dead provider"),
+            Err(e) => e,
+        };
+        let elapsed = start.elapsed();
+        assert!(matches!(result, LlmError::Provider(_)), "got {result:?}");
+        // 3 attempts => 2 sleeps: 500ms + 1000ms.
+        assert_eq!(elapsed, std::time::Duration::from_millis(1500));
+        assert!(elapsed >= std::time::Duration::from_millis(1500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_first_backoff_sleep_is_500ms() {
+        // The first retry always sleeps the schedule's first entry (500ms)
+        // before attempt 2; with paused time no wall-clock waiting occurs.
+        let start = tokio::time::Instant::now();
+        let client = retry_client();
+        let messages = [ChatMessage::Text(ChatRole::User, "hi".into())];
+        let _ = client.chat_stream(&messages).await;
+        assert!(start.elapsed() >= std::time::Duration::from_millis(500));
     }
 }
