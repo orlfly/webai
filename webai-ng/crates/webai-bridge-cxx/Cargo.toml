@@ -20,6 +20,13 @@ thiserror = { workspace = true }
 # (ARCHITECTURE.md §4.7 / §10).
 cxx = { version = "1.0", optional = true }
 
+[build-dependencies]
+# Only used when `legacy_cpp` is enabled; the build.rs short-circuits
+# otherwise so the default build never invokes pkg-config or cc.
+cxx-build = { version = "1.0", optional = true }
+cc = { version = "1.0", optional = true }
+pkg-config = { version = "0.3", optional = true }
+
 [features]
 default = []
-legacy_cpp = ["dep:cxx"]
+legacy_cpp = ["dep:cxx", "dep:cxx-build", "dep:cc", "dep:pkg-config"]

@@ -5,10 +5,35 @@
 //! guard flags (`max_steps`, `duplicate_threshold`), and the `AgentSession`
 //! transcript container. Real LLM-driven looping lands in M4.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use webai_llm::LlmClient;
 use webai_memory::SharedMemoryStore;
+
+pub mod plan_loop;
+pub mod runner;
+pub mod runtime;
+pub mod sandbox;
+pub mod script_memory;
+pub mod session;
+pub mod summariser;
+pub mod tools;
+
+pub use plan_loop::{requires_plan, LoopError, LoopGuards, PLAN_DIRECTIVE, STATE_BLOCK_MARKER};
+pub use runner::{
+    outcome_code, AgentRunner, AgentStep, RunConfig, StepOutcome, StubExecutor, ToolExecutor,
+};
+pub use runtime::{
+    bootstrap, build_agent_loop, check_public_gate, launch, memory_store, resume_transcript,
+    scan_sessions, LaunchHooks, LaunchMode, LaunchOutcome, Runtime, RuntimeError,
+};
+pub use sandbox::{PathSandbox, SandboxError};
+pub use script_memory::{RepairError, ReuseHit, ScriptMemory};
+pub use session::{AgentSession, SessionOptions, SessionState};
+pub use summariser::{HistorySummariser, Role, SummarisedHistory, SummariserConfig, Turn};
+pub use tools::{
+    AcpNotifyTool, BrowserTool, FilesystemTool, LlmTool, MemoryTool, TerminateTool, ToolRegistry,
+};
 
 /// The core tools (browser / memory / filesystem / llm / acp_notify) plus
 /// terminate. Each tool handles one call and returns structured output.
@@ -48,7 +73,11 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
-    pub fn new(llm: Arc<LlmClient>, memory: Arc<SharedMemoryStore>, tools: Vec<Arc<dyn Tool>>) -> Self {
+    pub fn new(
+        llm: Arc<LlmClient>,
+        memory: Arc<SharedMemoryStore>,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Self {
         Self::with_config(llm, memory, tools, LoopConfig::default())
     }
 
@@ -88,57 +117,6 @@ impl AgentLoop {
 pub enum ChatMessage {
     User(String),
     Assistant(String),
-}
-
-/// The durable session container (ARCHITECTURE.md §4.9): transcript +
-/// `Arc<AgentLoop>` + optional `Arc<SharedMemoryStore>`.
-pub struct AgentSession {
-    session_id: String,
-    transcript: Mutex<Vec<ChatMessage>>,
-    loop_: Arc<AgentLoop>,
-    memory: Arc<SharedMemoryStore>,
-}
-
-/// Manual `Debug` impl because `AgentLoop` contains a `dyn Tool` which is not
-/// `Debug`.
-impl std::fmt::Debug for AgentSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentSession")
-            .field("session_id", &self.session_id)
-            .field("transcript_len", &self.transcript.lock().unwrap().len())
-            .finish()
-    }
-}
-
-impl AgentSession {
-    pub fn new(session_id: impl Into<String>, loop_: Arc<AgentLoop>, memory: Arc<SharedMemoryStore>) -> Self {
-        Self {
-            session_id: session_id.into(),
-            transcript: Mutex::new(Vec::new()),
-            loop_,
-            memory,
-        }
-    }
-
-    pub fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    pub fn transcript(&self) -> Vec<ChatMessage> {
-        self.transcript.lock().unwrap().clone()
-    }
-
-    pub fn push(&self, message: ChatMessage) {
-        self.transcript.lock().unwrap().push(message);
-    }
-
-    pub fn agent_loop(&self) -> &Arc<AgentLoop> {
-        &self.loop_
-    }
-
-    pub fn memory(&self) -> &Arc<SharedMemoryStore> {
-        &self.memory
-    }
 }
 
 /// A stub tool named `echo` for exercising the registry in tests.

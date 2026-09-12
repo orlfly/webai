@@ -17,9 +17,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 ratatui = { workspace = true }
-crossterm = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
 futures = { workspace = true }
 parking_lot = { workspace = true }
+
+base64 = "0.22"
 
 [dev-dependencies]
 webai-llm = { path = "../webai-llm" }

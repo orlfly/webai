@@ -199,13 +199,23 @@ pub struct BrowserToolResponse {
     /// Path to the auto-captured screenshot, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_path: Option<String>,
+    /// Structured warning when the auto-screenshot failed (the operation
+    /// itself succeeded; the screenshot is best-effort, FR-2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_warning: Option<BrowserToolError>,
 }
 
 /// Structured error raised by a browser-tool invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserToolError {
+    /// Stable error code (see [`codes`]).
     pub code: i32,
+    /// Human-readable message.
     pub message: String,
+    /// The failing phase, if any: `execute` or `verify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// The JS exception text (定论二), if the failure came from a script.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -274,6 +284,12 @@ pub mod codes {
     pub const LOAD_TIMEOUT: i32 = -32001;
     /// Path rejected by the filesystem-tool allowlist.
     pub const PATH_NOT_ALLOWED: i32 = -32002;
+    /// A browser-tool execute phase failed (JS exception).
+    pub const EXECUTE_FAILED: i32 = -32003;
+    /// A browser-tool verify phase failed (post-condition not met).
+    pub const VERIFY_FAILED: i32 = -32004;
+    /// A browser-tool request was missing a required argument.
+    pub const MISSING_ARG: i32 = -32005;
     /// Reserved upper bound for domain-specific codes.
     pub const DOMAIN_MAX: i32 = -32000;
 }
@@ -310,7 +326,11 @@ mod tests {
             (BrowserVerb::PressKey, "press_key", "press_key"),
             (BrowserVerb::Evaluate, "evaluate", "evaluate"),
             (BrowserVerb::Screenshot, "screenshot", "screenshot"),
-            (BrowserVerb::AccessibilityTree, "accessibility_tree", "accessibility_tree"),
+            (
+                BrowserVerb::AccessibilityTree,
+                "accessibility_tree",
+                "accessibility_tree",
+            ),
             (BrowserVerb::GetText, "get_text", "extract_text"),
             (BrowserVerb::GetHtml, "get_html", "extract_html"),
             (BrowserVerb::Download, "download", "download"),
@@ -393,7 +413,10 @@ mod tests {
         let json = serde_json::to_string(&envelope).unwrap();
         let value: Json = serde_json::from_str(&json).unwrap();
         assert!(value.get("id").is_none());
-        assert_eq!(value.get("method").and_then(|m| m.as_str()), Some("page.load"));
+        assert_eq!(
+            value.get("method").and_then(|m| m.as_str()),
+            Some("page.load")
+        );
     }
 
     #[test]
@@ -427,13 +450,19 @@ mod tests {
             },
         };
         let done_json = serde_json::to_string(&done).unwrap();
-        assert!(matches!(serde_json::from_str::<SessionEvent>(&done_json).unwrap(), SessionEvent::Done { .. }));
+        assert!(matches!(
+            serde_json::from_str::<SessionEvent>(&done_json).unwrap(),
+            SessionEvent::Done { .. }
+        ));
 
         let err = SessionEvent::Error {
             message: "boom".into(),
         };
         let err_json = serde_json::to_string(&err).unwrap();
-        assert!(matches!(serde_json::from_str::<SessionEvent>(&err_json).unwrap(), SessionEvent::Error { .. }));
+        assert!(matches!(
+            serde_json::from_str::<SessionEvent>(&err_json).unwrap(),
+            SessionEvent::Error { .. }
+        ));
     }
 
     #[test]
@@ -443,9 +472,73 @@ mod tests {
             result: Some(serde_json::json!({ "text": "hi" })),
             error: None,
             image_path: None,
+            screenshot_warning: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("image_path"));
         assert!(json.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn error_codes_have_stable_constants() {
+        // Every error code must have a constant and be non-zero (M-4).
+        let codes = [
+            codes::PARSE_ERROR,
+            codes::INVALID_REQUEST,
+            codes::METHOD_NOT_FOUND,
+            codes::INVALID_PARAMS,
+            codes::INTERNAL_ERROR,
+            codes::LOAD_TIMEOUT,
+            codes::PATH_NOT_ALLOWED,
+            codes::EXECUTE_FAILED,
+            codes::VERIFY_FAILED,
+            codes::MISSING_ARG,
+        ];
+        for c in codes {
+            assert_ne!(c, 0, "error code must be non-zero");
+        }
+        // Domain-specific codes fall in the reserved range [DOMAIN_MIN, DOMAIN_MAX].
+        for c in [
+            codes::EXECUTE_FAILED,
+            codes::VERIFY_FAILED,
+            codes::MISSING_ARG,
+        ] {
+            assert!(
+                (codes::DOMAIN_MIN..=codes::DOMAIN_MAX).contains(&c),
+                "code {c} out of domain range"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_tool_error_roundtrips_phase_and_exception_text() {
+        // A verify failure must survive serialization with phase + JS text.
+        let err = BrowserToolError {
+            code: codes::VERIFY_FAILED,
+            message: "verify phase failed".into(),
+            phase: Some("verify".into()),
+            detail: Some("TypeError: el is null".into()),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let back: BrowserToolError = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.code, codes::VERIFY_FAILED);
+        assert_eq!(back.phase.as_deref(), Some("verify"));
+        assert_eq!(back.detail.as_deref(), Some("TypeError: el is null"));
+        // No "unknown error" / empty code in the serialized form.
+        assert!(!json.contains("unknown error"));
+        assert!(json.contains("\"code\":-32004"));
+    }
+
+    #[test]
+    fn browser_tool_error_omits_phase_when_absent() {
+        let err = BrowserToolError {
+            code: codes::INTERNAL_ERROR,
+            message: "boom".into(),
+            phase: None,
+            detail: None,
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(!json.contains("phase"));
+        assert!(!json.contains("detail"));
     }
 }

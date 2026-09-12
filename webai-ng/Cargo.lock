@@ -205,6 +205,7 @@ checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
  "bitflags",
  "crossterm_winapi",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix 0.38.44",
@@ -2148,10 +2149,12 @@ dependencies = [
 name = "webai"
 version = "0.1.0"
 dependencies = [
+ "tokio",
  "webai-acp",
  "webai-agent",
  "webai-config",
  "webai-tui",
+ "webai-webkit",
 ]
 
 [[package]]
@@ -2185,6 +2188,7 @@ dependencies = [
  "tokio",
  "tracing",
  "webai-bridge",
+ "webai-config",
  "webai-llm",
  "webai-memory",
  "webai-protocol",
@@ -2210,7 +2214,10 @@ dependencies = [
 name = "webai-bridge-cxx"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "cxx",
+ "cxx-build",
+ "pkg-config",
  "serde",
  "serde_json",
  "thiserror",
@@ -2234,6 +2241,7 @@ name = "webai-embedding"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
@@ -2251,7 +2259,9 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
+ "webai-config",
  "webai-protocol",
 ]
 
@@ -2264,6 +2274,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "webai-embedding",
  "webai-protocol",
@@ -2291,6 +2302,7 @@ dependencies = [
 name = "webai-tui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "crossterm",
  "futures",
  "parking_lot",
@@ -2315,6 +2327,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "webai-bridge-cxx",
  "webai-protocol",
 ]
 

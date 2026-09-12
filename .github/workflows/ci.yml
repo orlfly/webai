@@ -1,0 +1,202 @@
+# Webai CI
+#
+# Quality gates for the webai-ng cargo workspace per task M1-5 and
+# ARCHITECTURE.md §3.2 (§3.2 "强制执行"):
+#   - layered dependency partial-order enforcement script (custom, §3.2)
+#   - cargo-deny: ban multiple versions + restrict sources (bans/sources)
+#   - license allow-list (fail closed)
+#   - a build with --no-default-features (Rust-only, must remain portable, §4.7)
+#
+# All gates share one job so the whole `webai-ng/` dir is covered without
+# per-crate duplication. Failing fast keeps the feedback loop tight.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "webai-ng/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "webai-ng/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the workspace root stable relative to the workflow file.
+  WORKSPACE: webai-ng
+
+jobs:
+  ci:
+    name: layering • deny • no-default-features
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKSPACE }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Reuse a shared cargo cache to keep dependency fetches fast.
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.WORKSPACE }}
+
+      # Rust-only build: no `legacy_cpp` features, must compile and pass tests
+      # on a machine with no WebKit/system C++ (ARCHITECTURE.md §4.7 / §10).
+      - name: Build with --no-default-features
+        run: cargo build --workspace --no-default-features
+
+      # Layered dependency partial-order enforcement (ARCHITECTURE.md §3.2).
+      # Written in stdlib-only Python so it needs no extra toolchain.
+      - name: Check crate layering (partial order §3.2)
+        run: python3 scripts/check-dep-layers.py --workspace .
+
+      # cargo-deny: bans (multiple versions), sources (crates.io only), licenses
+      # (allow-list). Advisories are intentionally not part of this job; M1-5 is
+      # scoped to ARCHITECTURE.md §3.2 enforcement (bans/sources/layering).
+      # Use default features (Rust-only, no opt-in C++ `legacy_cpp`): aligns with
+      # §4.7, which guarantees the portable Rust-only graph, not the C++ one.
+      - name: cargo-deny (bans / sources / licenses)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          manifest-path: webai-ng/Cargo.toml
+          arguments: --no-default-features
+          command-arguments: bans licenses sources
+
+  # Benchmark fixtures (PRODUCT-DESIGN.md §6 M-6): build artifacts must
+  # include the fixed fixture pages so perf and e2e jobs reference the same
+  # shipped files instead of ad-hoc pages.
+  fixtures:
+    name: fixture pages (M-6 benchmark fixtures)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fixture contract tests (node budgets, tracking)
+        run: cargo test -p webai-protocol --test fixture_pages
+        defaults:
+          run:
+            working-directory: ${{ env.WORKSPACE }}
+
+      - name: Upload fixture pages as build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-fixtures
+          path: |
+            webai-ng/fixtures/pages/static.html
+            webai-ng/fixtures/pages/spa.html
+            webai-ng/fixtures/pages/items.json
+          if-no-files-found: error
+
+  # Opt-in C++/WebKit path (task 33): must build and test with the
+  # `legacy_cpp` feature in a WPE-capable environment. Independent of the
+  # default job so one failing path never blocks the other.
+  legacy_cpp:
+    name: legacy_cpp (WPE real-device path)
+    runs-on: ubuntu-latest
+    container:
+      # Pinned reproducible image (tag convention + upgrade flow:
+      # webai-ng/docs/wpe-image.md). Never use `latest` here. Tag reflects
+      # the ACTUAL libwpewebkit (2.48.x) via wpe-2.48-rust90 (Major-1/2 #35).
+      image: orlfly/webai-ng-ci:wpe-2.48-rust90
+    defaults:
+      run:
+        working-directory: ${{ env.WORKSPACE }}
+    steps:
+      # Headless cog launch needs an offscreen display + X server; the image
+      # layer pins WPE_BACKEND=fdo, xvfb provides the display (Major-2 #35).
+      - name: Start offscreen display
+        run: |
+          Xvfb :99 -screen 0 1024x768x24 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          echo "WPE_BACKEND=fdo" >> "$GITHUB_ENV"
+
+      - name: Install toolchain + WPE dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl build-essential pkg-config libclang-dev clang \
+            libwpe-1.0-1 libwpebackend-fdo-1.0-1 libwpewebkit-1.0-1
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.WORKSPACE }}
+
+      - name: Build with --features legacy_cpp
+        run: cargo build -p webai-bridge-cxx --features legacy_cpp
+
+      - name: Unit tests with --features legacy_cpp
+        run: cargo test -p webai-bridge-cxx --features legacy_cpp
+
+      # Real-device smoke: feature-gated + #[ignore]d integration test that
+      # launches the cog view and prefights one browser verb. Only meaningful
+      # inside a WPE-capable image, hence --ignored here.
+      - name: Real-device smoke (launch + preflight)
+        run: cargo test -p webai-bridge-cxx --features legacy_cpp --test legacy_cpp_smoke -- --ignored --nocapture
+
+  # M-6 memory gate: single-session idle RSS < 300 MB on the benchmark
+  # fixtures, measured in the WPE-capable environment. Threshold assertion
+  # fails the job when exceeded (PRODUCT-DESIGN.md §6 M-6 / M-7).
+  rss_gate:
+    name: rss gate (M-6 memory budget)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm-slim
+    defaults:
+      run:
+        working-directory: ${{ env.WORKSPACE }}
+    steps:
+      - name: Install toolchain + WPE dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl build-essential pkg-config libclang-dev clang \
+            python3 procps \
+            libwpe-1.0-1 libwpebackend-fdo-1.0-1 libwpewebkit-1.0-1
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.WORKSPACE }}
+
+      - name: Build release binary
+        run: cargo build --release -p webai
+
+      - name: RSS gate on static fixture
+        run: python3 scripts/rss_sample.py --fixture fixtures/pages/static.html --threshold-mb 300
+
+      - name: RSS gate on spa fixture
+        run: python3 scripts/rss_sample.py --fixture fixtures/pages/spa.html --threshold-mb 300
+
+      - name: Budget cross-check (max_concurrent_sessions = 4)
+        # 4 sessions must project within the documented M-6 pool budget:
+        # verdict printed for the report; assertion guards the projection.
+        run: python3 scripts/rss_budget_crosscheck.py --per-session-mb 300 --sessions 4 --pool-budget-mb 1250

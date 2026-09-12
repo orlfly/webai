@@ -10,7 +10,16 @@
 //! - **`legacy_cpp`**: pulls the `cxx` bridge to cog / libwpe. Only enabled on an
 //!   actual WebKit build environment.
 
+// The cxx-generated bridge module and the `rust::Fn` callback type trigger
+// several clippy lints (unsafe-fn docs, complex types) that are inherent to
+// the cxx codegen and not actionable in hand-written code. The reference
+// implementation takes the same approach.
+#![cfg_attr(feature = "legacy_cpp", allow(clippy::all))]
+
 use webai_protocol::{BrowserToolResponse, BrowserVerb};
+
+#[cfg(feature = "legacy_cpp")]
+use std::os::raw::c_char;
 
 /// Structured error when an FFI / cog environment is required but unavailable.
 #[derive(Debug, thiserror::Error)]
@@ -21,16 +30,34 @@ pub enum BridgeCxxError {
     Ffi(String),
 }
 
+/// A load-finished notification reported from the C++ side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadFinished {
+    pub uri: String,
+    pub title: String,
+    pub status: i32,
+}
+
 /// The C++ bridge facade (ARCHITECTURE.md §4.7).
 ///
 /// In default (no-`legacy_cpp`) builds every method returns
-/// [`BridgeCxxError::CogLaunch`], which the WebKit crate surfaces as
-/// `WebkitError::CogLaunch`. The struct still exists so higher layers can be
-/// assembled before M2 wires the real C++ implementation.
-#[derive(Debug, Clone, Default)]
+/// [`BridgeCxxError::CogLaunch`]. With `legacy_cpp` the facade wraps the real
+/// cog/WPE view lifecycle and API forwarding.
+#[derive(Debug, Default)]
 pub struct WebkitBridgeCxx {
     launched: bool,
+    #[cfg(feature = "legacy_cpp")]
+    view: Option<*mut ffi::WebkitView>,
 }
+
+// SAFETY: the raw `*mut WebkitView` is only ever accessed through the cxx
+// bridge, which serializes all view access on the dedicated loop thread
+// (ARCHITECTURE.md §6). The facade methods take `&self` and the underlying
+// C++ bridge owns the view lifetime, so it is safe to share across threads.
+#[cfg(feature = "legacy_cpp")]
+unsafe impl Send for WebkitBridgeCxx {}
+#[cfg(feature = "legacy_cpp")]
+unsafe impl Sync for WebkitBridgeCxx {}
 
 impl WebkitBridgeCxx {
     /// Launch/attach the real cog view. Only succeeds when compiled with the
@@ -46,8 +73,14 @@ impl WebkitBridgeCxx {
         }
         #[cfg(feature = "legacy_cpp")]
         {
-            // Real cxx bridge lives in an M2 follow-up. Stub signals success so
-            // the feature-gated path at least compiles and links.
+            let view = unsafe { ffi::webkit_bridge_open() }
+                .map_err(|e| BridgeCxxError::Ffi(e.to_string()))?;
+            if view.is_null() {
+                return Err(BridgeCxxError::Ffi(
+                    "webkit_bridge_open returned null (cog/WPE init failed)".into(),
+                ));
+            }
+            self.view = Some(view);
             self.launched = true;
             Ok(())
         }
@@ -58,16 +91,148 @@ impl WebkitBridgeCxx {
         self.launched
     }
 
-    /// Compile a browser request into a two-phase script module (this is a
-    /// pure helper; actual script composing lives in `webai-script`). In stub
-    /// mode we surface CogLaunch until the real bridge is wired.
-    pub fn preflight_browser_request(
-        &self,
-        verb: BrowserVerb,
-    ) -> Result<(), BridgeCxxError> {
+    /// Register a callback fired on `WEBKIT_LOAD_FINISHED`.
+    pub fn set_load_callback<F>(&mut self, cb: F)
+    where
+        F: Fn(LoadFinished) + Send + 'static,
+    {
+        #[cfg(feature = "legacy_cpp")]
+        {
+            LOAD_CALLBACK.with(|c| *c.borrow_mut() = Some(Box::new(cb)));
+            if let Some(view) = self.view {
+                unsafe {
+                    ffi::webkit_bridge_set_load_callback(view, load_trampoline);
+                }
+            }
+        }
+        #[cfg(not(feature = "legacy_cpp"))]
+        {
+            let _ = cb;
+        }
+    }
+
+    /// Navigate the view to `uri`.
+    pub fn load_uri(&self, uri: &str) -> Result<(), BridgeCxxError> {
+        #[cfg(not(feature = "legacy_cpp"))]
+        {
+            let _ = uri;
+            Err(BridgeCxxError::CogLaunch(
+                "load_uri requires the legacy_cpp feature".into(),
+            ))
+        }
+        #[cfg(feature = "legacy_cpp")]
+        {
+            let view = self
+                .view
+                .ok_or_else(|| BridgeCxxError::CogLaunch("view not launched".into()))?;
+            let rc = unsafe { ffi::webkit_bridge_load_uri(view, uri) };
+            if rc != 0 {
+                return Err(BridgeCxxError::Ffi(format!(
+                    "webkit_bridge_load_uri returned {rc}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    /// Inject a document-start user script.
+    pub fn inject_user_script(&self, script: &str) -> Result<(), BridgeCxxError> {
+        #[cfg(not(feature = "legacy_cpp"))]
+        {
+            let _ = script;
+            Err(BridgeCxxError::CogLaunch(
+                "inject_user_script requires the legacy_cpp feature".into(),
+            ))
+        }
+        #[cfg(feature = "legacy_cpp")]
+        {
+            let view = self
+                .view
+                .ok_or_else(|| BridgeCxxError::CogLaunch("view not launched".into()))?;
+            let rc = unsafe { ffi::webkit_bridge_inject_user_script(view, script) };
+            if rc != 0 {
+                return Err(BridgeCxxError::Ffi(format!(
+                    "webkit_bridge_inject_user_script returned {rc}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    /// Evaluate a JavaScript snippet, returning the JSON payload.
+    pub fn evaluate(&self, js: &str, timeout_ms: u32) -> Result<String, BridgeCxxError> {
+        #[cfg(not(feature = "legacy_cpp"))]
+        {
+            let _ = (js, timeout_ms);
+            Err(BridgeCxxError::CogLaunch(
+                "evaluate requires the legacy_cpp feature".into(),
+            ))
+        }
+        #[cfg(feature = "legacy_cpp")]
+        {
+            let view = self
+                .view
+                .ok_or_else(|| BridgeCxxError::CogLaunch("view not launched".into()))?;
+            let mut kind: i32 = 3;
+            let mut payload = cxx::UniquePtr::null();
+            let rc = unsafe {
+                ffi::webkit_bridge_evaluate_javascript(
+                    view,
+                    js,
+                    timeout_ms,
+                    &mut kind,
+                    &mut payload,
+                )
+            };
+            if rc != 0 {
+                return Err(BridgeCxxError::Ffi(format!(
+                    "webkit_bridge_evaluate_javascript returned {rc}"
+                )));
+            }
+            let payload_str = if payload.is_null() {
+                String::new()
+            } else {
+                payload.to_string_lossy().into_owned()
+            };
+            match kind {
+                0 => Ok(payload_str),
+                1 => Err(BridgeCxxError::Ffi("evaluate timed out".into())),
+                2 => Err(BridgeCxxError::Ffi(format!("script error: {payload_str}"))),
+                _ => Err(BridgeCxxError::Ffi("evaluate returned invalid kind".into())),
+            }
+        }
+    }
+
+    /// Capture a PNG screenshot of the current view to `dest_path`.
+    pub fn screenshot(&self, dest_path: &str) -> Result<(), BridgeCxxError> {
+        #[cfg(not(feature = "legacy_cpp"))]
+        {
+            let _ = dest_path;
+            Err(BridgeCxxError::CogLaunch(
+                "screenshot requires the legacy_cpp feature".into(),
+            ))
+        }
+        #[cfg(feature = "legacy_cpp")]
+        {
+            let view = self
+                .view
+                .ok_or_else(|| BridgeCxxError::CogLaunch("view not launched".into()))?;
+            let rc = unsafe { ffi::webkit_bridge_screenshot(view, dest_path) };
+            if rc != 0 {
+                return Err(BridgeCxxError::Ffi(format!(
+                    "webkit_bridge_screenshot returned {rc}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    /// Compile a browser request into a two-phase script module (pure helper;
+    /// actual script composing lives in `webai-script`).
+    pub fn preflight_browser_request(&self, verb: BrowserVerb) -> Result<(), BridgeCxxError> {
         if !self.launched {
             return Err(BridgeCxxError::CogLaunch(format!(
-                "preflight_browser_request({verb:?}) requires a launched coy view"
+                "preflight_browser_request({verb:?}) requires a launched view"
             )));
         }
         Ok(())
@@ -85,14 +250,94 @@ impl WebkitBridgeCxx {
             result: Some(serde_json::json!({ "stub": true })),
             error: None,
             image_path: None,
+            screenshot_warning: None,
         })
     }
+}
+
+impl Drop for WebkitBridgeCxx {
+    fn drop(&mut self) {
+        #[cfg(feature = "legacy_cpp")]
+        {
+            if let Some(view) = self.view.take() {
+                unsafe { ffi::webkit_bridge_close(view) };
+            }
+        }
+    }
+}
+
+// The cxx bridge block. Only compiled when `legacy_cpp` is enabled.
+#[cfg(feature = "legacy_cpp")]
+#[cxx::bridge]
+pub mod ffi {
+    unsafe extern "C++" {
+        include!("wrapper.h");
+
+        type WebkitView;
+
+        unsafe fn webkit_bridge_open() -> Result<*mut WebkitView>;
+        unsafe fn webkit_bridge_close(view: *mut WebkitView);
+        unsafe fn webkit_bridge_load_uri(view: *mut WebkitView, uri: &str) -> i32;
+        unsafe fn webkit_bridge_inject_user_script(view: *mut WebkitView, script: &str) -> i32;
+        unsafe fn webkit_bridge_evaluate_javascript(
+            view: *mut WebkitView,
+            script: &str,
+            timeout_ms: u32,
+            kind_out: &mut i32,
+            payload_out: &mut UniquePtr<CxxString>,
+        ) -> i32;
+        unsafe fn webkit_bridge_resize(view: *mut WebkitView, width: u32, height: u32) -> i32;
+        unsafe fn webkit_bridge_screenshot(view: *mut WebkitView, dest_path: &str) -> i32;
+        unsafe fn webkit_bridge_set_load_callback(
+            view: *mut WebkitView,
+            callback: unsafe extern "C" fn(*const c_char, *const c_char, i32),
+        );
+    }
+}
+
+// Rust-side callback invoked by the C++ bridge on `WEBKIT_LOAD_FINISHED`.
+// Stored in a thread-local so the C++ trampoline can route to it.
+#[cfg(feature = "legacy_cpp")]
+thread_local! {
+    static LOAD_CALLBACK: std::cell::RefCell<Option<Box<dyn Fn(LoadFinished) + Send>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Rust callback fired by the C++ side on `WEBKIT_LOAD_FINISHED`. cxx wraps
+/// this safe Rust `fn` into a `rust::Fn` on the C++ side.
+#[cfg(feature = "legacy_cpp")]
+fn load_trampoline(uri: *const c_char, title: *const c_char, status: i32) {
+    let uri = if uri.is_null() {
+        String::new()
+    } else {
+        // SAFETY: the C++ side passes a valid NUL-terminated C string.
+        unsafe { std::ffi::CStr::from_ptr(uri) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let title = if title.is_null() {
+        String::new()
+    } else {
+        // SAFETY: the C++ side passes a valid NUL-terminated C string.
+        unsafe { std::ffi::CStr::from_ptr(title) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let event = LoadFinished { uri, title, status };
+    LOAD_CALLBACK.with(|c| {
+        if let Some(cb) = c.borrow().as_ref() {
+            cb(event);
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // These tests assert the no-FFI (default) behaviour: every operation
+    // returns CogLaunch. They only apply when `legacy_cpp` is disabled.
+    #[cfg(not(feature = "legacy_cpp"))]
     #[test]
     fn default_build_returns_cog_launch_error_on_launch() {
         let mut bridge = WebkitBridgeCxx::default();
@@ -103,6 +348,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "legacy_cpp"))]
     #[test]
     fn preflight_requires_launched_view() {
         let bridge = WebkitBridgeCxx::default();
@@ -115,5 +361,35 @@ mod tests {
     #[test]
     fn not_launched_by_default() {
         assert!(!WebkitBridgeCxx::default().is_launched());
+    }
+
+    #[cfg(not(feature = "legacy_cpp"))]
+    #[test]
+    fn load_uri_returns_cog_launch_without_feature() {
+        let bridge = WebkitBridgeCxx::default();
+        assert!(matches!(
+            bridge.load_uri("https://example.com"),
+            Err(BridgeCxxError::CogLaunch(_))
+        ));
+    }
+
+    #[cfg(not(feature = "legacy_cpp"))]
+    #[test]
+    fn evaluate_returns_cog_launch_without_feature() {
+        let bridge = WebkitBridgeCxx::default();
+        assert!(matches!(
+            bridge.evaluate("1+1", 100),
+            Err(BridgeCxxError::CogLaunch(_))
+        ));
+    }
+
+    #[cfg(not(feature = "legacy_cpp"))]
+    #[test]
+    fn screenshot_returns_cog_launch_without_feature() {
+        let bridge = WebkitBridgeCxx::default();
+        assert!(matches!(
+            bridge.screenshot("/tmp/x.png"),
+            Err(BridgeCxxError::CogLaunch(_))
+        ));
     }
 }
