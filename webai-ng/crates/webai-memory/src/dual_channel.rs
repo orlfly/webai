@@ -14,7 +14,7 @@
 //! path and reopened on restart.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use serde_json::Value as Json;
@@ -49,7 +49,7 @@ pub enum MemoryError {
 }
 
 /// Configuration for the dual-channel store (from `mem.toml` / `vec.toml`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryConfig {
     /// Graph backend name (e.g. `kuzu`).
     pub graph_backend: String,
@@ -75,6 +75,63 @@ impl Default for MemoryConfig {
             dim: 1024,
             index_path: PathBuf::from(".webai/vec"),
         }
+    }
+}
+
+impl MemoryConfig {
+    /// Parse a config from `mem.toml` + `vec.toml` (task #78, review
+    /// Major-1): the HNSW parameters, dimension and index path were declared
+    /// but never read; this loads them into the store config.
+    ///
+    /// Missing files fall back to `Default` per field group; malformed files
+    /// degrade the same way (logged by the caller).
+    pub fn from_toml_files(mem_toml: &Path, vec_toml: &Path) -> Self {
+        let mut cfg = Self::default();
+
+        // mem.toml: graph_backend name.
+        if let Ok(raw) = std::fs::read_to_string(mem_toml) {
+            if let Ok(value) = toml::from_str::<toml::Value>(&raw) {
+                if let Some(name) = value.get("graph_backend").and_then(|v| v.as_str()) {
+                    cfg.graph_backend = name.to_owned();
+                }
+            } else {
+                tracing::warn!(file = %mem_toml.display(), "malformed mem.toml; using defaults");
+            }
+        }
+
+        // vec.toml: vector backend name, hnsw_m / hnsw_ef, dim, index_path.
+        if let Ok(raw) = std::fs::read_to_string(vec_toml) {
+            match toml::from_str::<toml::Value>(&raw) {
+                Ok(value) => {
+                    if let Some(name) = value.get("backend").and_then(|v| v.as_str()) {
+                        cfg.vector_backend = name.to_owned();
+                    }
+                    if let Some(m) = value.get("hnsw_m").and_then(|v| v.as_integer()) {
+                        cfg.hnsw_m = m.max(1) as usize;
+                    }
+                    if let Some(ef) = value.get("hnsw_ef").and_then(|v| v.as_integer()) {
+                        cfg.hnsw_ef = ef.max(1) as usize;
+                    }
+                    if let Some(dim) = value.get("dim").and_then(|v| v.as_integer()) {
+                        cfg.dim = dim.max(1) as usize;
+                    }
+                    if let Some(p) = value.get("index_path").and_then(|v| v.as_str()) {
+                        cfg.index_path = PathBuf::from(p);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(file = %vec_toml.display(), err = %e, "malformed vec.toml; using defaults");
+                }
+            }
+        }
+
+        cfg
+    }
+
+    /// Validate the backend names. `kuzu` (graph) and `hnsw` (vector) are the
+    /// only compiled-in backends; anything else degrades (task #78).
+    pub fn backends_supported(&self) -> bool {
+        self.graph_backend == "kuzu" && self.vector_backend == "hnsw"
     }
 }
 
@@ -177,6 +234,11 @@ impl SharedMemoryStore {
 
     /// Construct a store from a config. If the backend is unavailable, the
     /// store degrades to no-memory mode (logs a clear message, never fails).
+    ///
+    /// Backend-name validity is checked here (task #78): an unknown
+    /// graph/vector backend degrades to `disabled = true` with a log line, so
+    /// "backend stopped / misconfigured" surfaces as a degradation signal
+    /// rather than a half-working store.
     pub fn from_config(config: MemoryConfig) -> Self {
         let mut store = Self {
             graph: Arc::new(RwLock::new(GraphBackend::default())),
@@ -184,6 +246,16 @@ impl SharedMemoryStore {
             config: config.clone(),
             disabled: false,
         };
+        // Backend-name validity: unknown names degrade up front.
+        if !config.backends_supported() {
+            tracing::warn!(
+                graph = %config.graph_backend,
+                vector = %config.vector_backend,
+                "unsupported memory backend name; degrading to no-memory"
+            );
+            store.disabled = true;
+            return store;
+        }
         // Try to reopen a persisted index.
         if let Err(e) = store.reopen_index() {
             tracing::warn!(err = %e, "memory vector index reopen failed; degrading to no-memory");
@@ -453,5 +525,78 @@ mod tests {
         });
         assert_eq!(reopened.len(), 2, "index reopen must restore entry count");
         let _ = std::fs::remove_file(&idx);
+    }
+
+    /// Task #78 acceptance 1: sample mem.toml / vec.toml parse into the
+    /// config fields (previously declared but never read).
+    #[test]
+    fn from_toml_files_parses_hnsw_and_backend_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "webai-dual-cfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mem = dir.join("mem.toml");
+        let vec = dir.join("vec.toml");
+        std::fs::write(&mem, "graph_backend = \"kuzu\"\n").unwrap();
+        std::fs::write(
+            &vec,
+            "backend = \"hnsw\"\nhnsw_m = 32\nhnsw_ef = 128\ndim = 512\nindex_path = \"/tmp/vec-idx\"\n",
+        )
+        .unwrap();
+        let cfg = MemoryConfig::from_toml_files(&mem, &vec);
+        assert_eq!(cfg.graph_backend, "kuzu");
+        assert_eq!(cfg.vector_backend, "hnsw");
+        assert_eq!(cfg.hnsw_m, 32);
+        assert_eq!(cfg.hnsw_ef, 128);
+        assert_eq!(cfg.dim, 512);
+        assert_eq!(cfg.index_path, PathBuf::from("/tmp/vec-idx"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Task #78 acceptance 2: an unknown backend name degrades to a disabled
+    /// store (is_available == false, write_script -> BackendUnavailable).
+    #[test]
+    fn from_config_unknown_backend_degrades_to_disabled() {
+        let store = SharedMemoryStore::from_config(MemoryConfig {
+            graph_backend: "not-a-graph-db".into(),
+            vector_backend: "hnsw".into(),
+            ..Default::default()
+        });
+        assert!(!store.is_available(), "unknown backend must degrade");
+        let entry = ScriptMemoryEntry {
+            task: "t".into(),
+            verb: "click".into(),
+            url: "https://example.com".into(),
+            script: "s".into(),
+            tags: vec![],
+            id: "x".into(),
+        };
+        let err = store.write_script(entry).unwrap_err();
+        assert!(matches!(err, MemoryError::BackendUnavailable(_)));
+        // A bad vector backend degrades identically.
+        let store2 = SharedMemoryStore::from_config(MemoryConfig {
+            vector_backend: "faiss".into(),
+            ..Default::default()
+        });
+        assert!(!store2.is_available());
+    }
+
+    /// Malformed TOML files degrade to defaults rather than failing startup.
+    #[test]
+    fn from_toml_files_malformed_falls_back_to_defaults() {
+        let dir = std::env::temp_dir().join(format!("webai-dual-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mem = dir.join("mem.toml");
+        let vec = dir.join("vec.toml");
+        std::fs::write(&mem, "not [valid toml ===").unwrap();
+        std::fs::write(&vec, "also broken {{{").unwrap();
+        let cfg = MemoryConfig::from_toml_files(&mem, &vec);
+        assert_eq!(cfg, MemoryConfig::default());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

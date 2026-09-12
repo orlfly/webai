@@ -13,6 +13,7 @@ webai-protocol = { path = "../webai-protocol" }
 webai-embedding = { path = "../webai-embedding" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
