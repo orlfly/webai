@@ -78,7 +78,8 @@ pub fn encode_kitty(png: &[u8]) -> Vec<u8> {
 }
 
 /// iTerm2 inline images protocol: `ESC]1337;File=inline=1;size=<n>:<base64>`
-/// terminated by `ESC\` (the ST form; BEL is also legal).
+/// terminated by BEL (0x07) — the canonical iTerm2 form (ST/`ESC\` is also
+/// legal but we emit BEL).
 pub fn encode_iterm2(png: &[u8]) -> Vec<u8> {
     let b64 = base64::engine::general_purpose::STANDARD.encode(png);
     let mut out = Vec::with_capacity(b64.len() + 64);
@@ -90,6 +91,11 @@ pub fn encode_iterm2(png: &[u8]) -> Vec<u8> {
 
 /// Sixel: `ESC P q "1;1;<w>;<h>` header with device attributes followed by
 /// sixel payload bytes and the string terminator `ESC\`.
+///
+/// Not reachable from `detect_protocol()` any more (评审 #81 Major-1): without
+/// a real PNG→quantised-sixel pixel converter this encoder would draw fake
+/// stripes for any image. Kept as an explicit, documented stub for a future
+/// converter; terminals reporting sixel degrade to the placeholder path.
 pub fn encode_sixel(width: u32, height: u32) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&[ESC, b'P', b'q']);

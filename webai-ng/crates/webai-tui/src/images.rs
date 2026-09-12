@@ -38,11 +38,13 @@ impl ImageProtocol {
     }
 }
 
-/// Probe the terminal for graphics support (Kitty → iTerm2 → Sixel order).
+/// Probe the terminal for graphics support (Kitty → iTerm2 order; Sixel is
+/// deliberately NOT detected: without a PNG→palette sixel pixel converter we
+/// cannot render honest pixels, so sixel-only terminals degrade to the
+/// placeholder path instead of drawing fake stripes — 评审 #81 Major-1).
 ///
 /// Detection uses the documented env markers: `KITTY_WINDOW_ID` (Kitty),
-/// `TERM_PROGRAM=iTerm.app` / `WezTerm` (iTerm2 protocol), `TERM` containing
-/// `sixel`/`mlterm`/`xterm` with sixtle… Sixel fallback checks `TERM` suffixes.
+/// `TERM_PROGRAM=iTerm.app` / `WezTerm` (iTerm2 protocol).
 pub fn detect_protocol() -> Option<ImageProtocol> {
     if std::env::var_os("KITTY_WINDOW_ID").is_some() || std::env::var_os("KITTY_PID").is_some() {
         return Some(ImageProtocol::Kitty);
@@ -52,12 +54,7 @@ pub fn detect_protocol() -> Option<ImageProtocol> {
             return Some(ImageProtocol::ITerm2);
         }
     }
-    if let Ok(term) = std::env::var("TERM") {
-        let lower = term.to_lowercase();
-        if lower.contains("sixel") || lower.contains("mlterm") {
-            return Some(ImageProtocol::Sixel);
-        }
-    }
+    // Sixel terminals intentionally fall through to None (placeholder).
     None
 }
 
@@ -424,8 +421,10 @@ mod tests {
         assert!(matches!(detect_protocol(), Some(ImageProtocol::ITerm2)));
         std::env::remove_var("TERM_PROGRAM");
 
+        // Sixel terminals intentionally degrade to None (评审 #81 Major-1):
+        // no real pixel converter => placeholder instead of fake stripes.
         std::env::set_var("TERM", "xterm-256color-sixel");
-        assert!(matches!(detect_protocol(), Some(ImageProtocol::Sixel)));
+        assert!(detect_protocol().is_none(), "sixel must degrade to placeholder");
         std::env::remove_var("TERM");
     }
 
