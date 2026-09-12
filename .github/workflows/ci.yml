@@ -1,0 +1,75 @@
+# Webai CI
+#
+# Quality gates for the webai-ng cargo workspace per task M1-5 and
+# ARCHITECTURE.md §3.2 (§3.2 "强制执行"):
+#   - layered dependency partial-order enforcement script (custom, §3.2)
+#   - cargo-deny: ban multiple versions + restrict sources (bans/sources)
+#   - license allow-list (fail closed)
+#   - a build with --no-default-features (Rust-only, must remain portable, §4.7)
+#
+# All gates share one job so the whole `webai-ng/` dir is covered without
+# per-crate duplication. Failing fast keeps the feedback loop tight.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "webai-ng/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "webai-ng/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the workspace root stable relative to the workflow file.
+  WORKSPACE: webai-ng
+
+jobs:
+  ci:
+    name: layering • deny • no-default-features
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKSPACE }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Reuse a shared cargo cache to keep dependency fetches fast.
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.WORKSPACE }}
+
+      # Rust-only build: no `legacy_cpp` features, must compile and pass tests
+      # on a machine with no WebKit/system C++ (ARCHITECTURE.md §4.7 / §10).
+      - name: Build with --no-default-features
+        run: cargo build --workspace --no-default-features
+
+      # Layered dependency partial-order enforcement (ARCHITECTURE.md §3.2).
+      # Written in stdlib-only Python so it needs no extra toolchain.
+      - name: Check crate layering (partial order §3.2)
+        run: python3 scripts/check-dep-layers.py --workspace .
+
+      # cargo-deny: bans (multiple versions), sources (crates.io only), licenses
+      # (allow-list). Advisories are intentionally not part of this job; M1-5 is
+      # scoped to ARCHITECTURE.md §3.2 enforcement (bans/sources/layering).
+      # Use default features (Rust-only, no opt-in C++ `legacy_cpp`): aligns with
+      # §4.7, which guarantees the portable Rust-only graph, not the C++ one.
+      - name: cargo-deny (bans / sources / licenses)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          manifest-path: webai-ng/Cargo.toml
+          arguments: --no-default-features
+          command-arguments: bans licenses sources
