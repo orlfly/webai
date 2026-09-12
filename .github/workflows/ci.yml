@@ -74,6 +74,35 @@ jobs:
           arguments: --no-default-features
           command-arguments: bans licenses sources
 
+  # Benchmark fixtures (PRODUCT-DESIGN.md §6 M-6): build artifacts must
+  # include the fixed fixture pages so perf and e2e jobs reference the same
+  # shipped files instead of ad-hoc pages.
+  fixtures:
+    name: fixture pages (M-6 benchmark fixtures)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fixture contract tests (node budgets, tracking)
+        run: cargo test -p webai-protocol --test fixture_pages
+        defaults:
+          run:
+            working-directory: ${{ env.WORKSPACE }}
+
+      - name: Upload fixture pages as build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-fixtures
+          path: |
+            webai-ng/fixtures/pages/static.html
+            webai-ng/fixtures/pages/spa.html
+            webai-ng/fixtures/pages/items.json
+          if-no-files-found: error
+
   # Opt-in C++/WebKit path (task 33): must build and test with the
   # `legacy_cpp` feature in a WPE-capable environment. Independent of the
   # default job so one failing path never blocks the other.
