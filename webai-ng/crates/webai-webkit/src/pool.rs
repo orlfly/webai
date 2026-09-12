@@ -110,6 +110,10 @@ pub struct WebkitViewPool {
     views: Arc<Mutex<HashMap<String, PooledView>>>,
     /// A factory for creating new views (injectable for tests).
     factory: Arc<dyn Fn() -> WebkitBridge + Send + Sync>,
+    /// Serialises the check-create-inject-insert critical section so two
+    /// concurrent acquires of the same (or a boundary) session cannot race
+    /// (task #77: TOCTOU leaked views / exceeded max_views).
+    create_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl WebkitViewPool {
@@ -119,6 +123,7 @@ impl WebkitViewPool {
             config,
             views: Arc::new(Mutex::new(HashMap::new())),
             factory: Arc::new(WebkitBridge::new),
+            create_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -131,6 +136,7 @@ impl WebkitViewPool {
             config,
             views: Arc::new(Mutex::new(HashMap::new())),
             factory: Arc::new(factory),
+            create_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -139,20 +145,30 @@ impl WebkitViewPool {
     /// If the session already has a view, it is reused. Otherwise a new view is
     /// created (respecting the pool limit) and injected with the document-start
     /// bundle in `BUNDLE_SCRIPT_ORDER`.
+    ///
+    /// The create path runs inside an exclusive `create_lock` critical section
+    /// (double-checked lookup → limit check → create → inject → insert), so
+    /// concurrent acquires can neither duplicate a session's view nor exceed
+    /// `max_views` (task #77 TOCTOU).
     pub async fn acquire(&self, session_id: &str) -> Result<PooledView, PoolError> {
         // Fast path: reuse an existing view (no lock held across await).
         if let Some(view) = self.views.lock().unwrap().get(session_id) {
             return Ok(view.clone());
         }
-        // Check the limit under the lock, then drop it before awaiting.
-        {
-            let views = self.views.lock().unwrap();
-            if views.len() >= self.config.max_views {
-                return Err(PoolError::Exhausted(format!(
-                    "max_views={} reached; release a view or raise the limit",
-                    self.config.max_views
-                )));
-            }
+        // Exclusive creation critical section: hold across the await so the
+        // double-check / limit / insert sequence is atomic w.r.t. other
+        // creators. Holders of existing views are unaffected.
+        let _guard = self.create_lock.lock().await;
+        // Double-check: another task may have created this session's view
+        // while we waited for the lock.
+        if let Some(view) = self.views.lock().unwrap().get(session_id) {
+            return Ok(view.clone());
+        }
+        if self.views.lock().unwrap().len() >= self.config.max_views {
+            return Err(PoolError::Exhausted(format!(
+                "max_views={} reached; release a view or raise the limit",
+                self.config.max_views
+            )));
         }
         let bridge = Arc::new((self.factory)());
         let view = PooledView {
@@ -342,5 +358,66 @@ mod tests {
         let (v1, v2) = tokio::join!(h1, h2);
         assert!(!Arc::ptr_eq(&v1.unwrap().bridge, &v2.unwrap().bridge));
         assert_eq!(pool.len(), 2);
+    }
+
+    /// Task #77 acceptance 1: N tasks racing to acquire the SAME new session
+    /// must create exactly one view (no leak from an overwritten insert).
+    #[tokio::test]
+    async fn concurrent_acquire_same_session_creates_exactly_one_view() {
+        let pool = Arc::new(WebkitViewPool::with_factory(
+            PoolConfig::default(),
+            canned_factory,
+        ));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let p = Arc::clone(&pool);
+            handles.push(tokio::spawn(
+                async move { p.acquire("race").await.unwrap() },
+            ));
+        }
+        let mut bridges = Vec::new();
+        for h in handles {
+            bridges.push(h.await.unwrap().bridge);
+        }
+        // Every caller observes the same underlying view.
+        assert!(bridges.windows(2).all(|w| Arc::ptr_eq(&w[0], &w[1])));
+        // Exactly one view exists — no leaked duplicate.
+        assert_eq!(pool.len(), 1);
+    }
+
+    /// Task #77 acceptance 2: distinct sessions racing at the max_views
+    /// boundary must never exceed the hard cap (structured Exhausted instead).
+    #[tokio::test]
+    async fn concurrent_acquire_at_limit_never_exceeds_max_views() {
+        const MAX: usize = 4;
+        let pool = Arc::new(WebkitViewPool::with_factory(
+            PoolConfig {
+                max_views: MAX,
+                ..Default::default()
+            },
+            canned_factory,
+        ));
+        // 12 racers over distinct session ids with only 4 slots: some must get
+        // a view, the rest a structured Exhausted — never exceeding MAX.
+        let mut handles = Vec::new();
+        for i in 0..12 {
+            let p = Arc::clone(&pool);
+            handles.push(tokio::spawn(
+                async move { p.acquire(&format!("s{i}")).await },
+            ));
+        }
+        let mut ok = 0;
+        let mut exhausted = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                Ok(_) => ok += 1,
+                Err(PoolError::Exhausted(_)) => exhausted += 1,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        assert_eq!(ok + exhausted, 12);
+        assert_eq!(ok, MAX, "exactly max_views slots are handed out");
+        assert_eq!(exhausted, 12 - MAX);
+        assert!(pool.len() <= MAX, "pool must never exceed max_views");
     }
 }
