@@ -11,19 +11,19 @@
 ## 2. 本地构建
 
 ```bash
-docker build -t orlfly/webai-ng-ci:wpe-2.50-rust90 -f webai-ng/ci/wpe.Dockerfile webai-ng/
+docker build -t orlfly/webai-ng-ci:wpe-2.48-rust90 -f webai-ng/ci/wpe.Dockerfile webai-ng/
 ```
 
 镜像内验证：
 
 ```bash
-docker run --rm -v "$PWD/webai-ng:/work" orlfly/webai-ng-ci:wpe-2.50-rust90 \
+docker run --rm -v "$PWD/webai-ng:/work" orlfly/webai-ng-ci:wpe-2.48-rust90 \
   bash -c "cargo build --features legacy_cpp -p webai-bridge-cxx"
 ```
 
 ## 3. Tag 约定
 
-`orlfly/webai-ng-ci:wpe-<WPEWEBKIT主.次>-rust<Rust次版本>`，如 `wpe-2.50-rust90`。
+`orlfly/webai-ng-ci:wpe-<WPEWEBKIT主.次>-rust<Rust次版本>`，如 `wpe-2.48-rust90`。**tag 的 MAJOR.MINOR 必须与镜像实际安装的 libwpewebkit 版本一致**（评审 #35 Major-1，避免误导升级排障）。
 
 **CI 必须引用固定 tag，禁止 `latest`**（`ci.yml` 中 `container.image` 写死）。
 
@@ -39,7 +39,7 @@ docker run --rm -v "$PWD/webai-ng:/work" orlfly/webai-ng-ci:wpe-2.50-rust90 \
 
 | 镜像 tag | WPE WebKit | libwpe | cog | Rust | cmake 参数（如源编） |
 |---|---|---|---|---|---|
-| wpe-2.50-rust90 | 2.48.x（bookworm 包） | 1.16.x | 0.19.x | 1.90.0 | 未源编（发行版包） |
+| wpe-2.48-rust90 | 2.48.x（bookworm 包） | 1.16.x | 0.19.x | 1.90.0 | 未源编（发行版包） |
 
 ## 5. 缓存策略与冷构建时长
 
@@ -55,4 +55,4 @@ docker run --rm -v "$PWD/webai-ng:/work" orlfly/webai-ng-ci:wpe-2.50-rust90 \
 ## 6. 与默认 stub 构建的关系
 
 - CI 两条**独立**路径（§10 硬性要求）：`ci` job（默认 feature，stub，无任何系统 WebKit 依赖）与 `legacy_cpp` job（本镜像，WPE 真机桥），互不阻塞。
-- 镜像内运行 headless/off-screen：`WPE_BACKEND=fdo` + xvfb（smoke 测试自带 `--ignored` 门），无显示环境时 WPEBackend-fdo 走 headless 合成。
+- 镜像内运行 headless/off-screen：Dockerfile 层固定 `ENV WPE_BACKEND=fdo`（评审 #35 Major-2），CI 另以 Xvfb 提供 DISPLAY（`Xvfb :99`）。smoke 测试自带 `--ignored` 门；无显示环境时 WPEBackend-fdo 走 headless 合成。

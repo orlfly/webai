@@ -82,12 +82,21 @@ jobs:
     runs-on: ubuntu-latest
     container:
       # Pinned reproducible image (tag convention + upgrade flow:
-      # webai-ng/docs/wpe-image.md). Never use `latest` here.
-      image: orlfly/webai-ng-ci:wpe-2.50-rust90
+      # webai-ng/docs/wpe-image.md). Never use `latest` here. Tag reflects
+      # the ACTUAL libwpewebkit (2.48.x) via wpe-2.48-rust90 (Major-1/2 #35).
+      image: orlfly/webai-ng-ci:wpe-2.48-rust90
     defaults:
       run:
         working-directory: ${{ env.WORKSPACE }}
     steps:
+      # Headless cog launch needs an offscreen display + X server; the image
+      # layer pins WPE_BACKEND=fdo, xvfb provides the display (Major-2 #35).
+      - name: Start offscreen display
+        run: |
+          Xvfb :99 -screen 0 1024x768x24 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          echo "WPE_BACKEND=fdo" >> "$GITHUB_ENV"
+
       - name: Install toolchain + WPE dependencies
         run: |
           apt-get update
