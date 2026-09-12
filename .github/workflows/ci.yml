@@ -144,3 +144,48 @@ jobs:
       # inside a WPE-capable image, hence --ignored here.
       - name: Real-device smoke (launch + preflight)
         run: cargo test -p webai-bridge-cxx --features legacy_cpp --test legacy_cpp_smoke -- --ignored --nocapture
+
+  # M-6 memory gate: single-session idle RSS < 300 MB on the benchmark
+  # fixtures, measured in the WPE-capable environment. Threshold assertion
+  # fails the job when exceeded (PRODUCT-DESIGN.md §6 M-6 / M-7).
+  rss_gate:
+    name: rss gate (M-6 memory budget)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm-slim
+    defaults:
+      run:
+        working-directory: ${{ env.WORKSPACE }}
+    steps:
+      - name: Install toolchain + WPE dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl build-essential pkg-config libclang-dev clang \
+            python3 procps \
+            libwpe-1.0-1 libwpebackend-fdo-1.0-1 libwpewebkit-1.0-1
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.WORKSPACE }}
+
+      - name: Build release binary
+        run: cargo build --release -p webai
+
+      - name: RSS gate on static fixture
+        run: python3 scripts/rss_sample.py --fixture fixtures/pages/static.html --threshold-mb 300
+
+      - name: RSS gate on spa fixture
+        run: python3 scripts/rss_sample.py --fixture fixtures/pages/spa.html --threshold-mb 300
+
+      - name: Budget cross-check (max_concurrent_sessions = 4)
+        # 4 sessions must project within the documented M-6 pool budget:
+        # verdict printed for the report; assertion guards the projection.
+        run: python3 scripts/rss_budget_crosscheck.py --per-session-mb 300 --sessions 4 --pool-budget-mb 1250
