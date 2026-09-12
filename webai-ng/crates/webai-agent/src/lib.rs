@@ -11,8 +11,12 @@ use webai_llm::LlmClient;
 use webai_memory::SharedMemoryStore;
 
 pub mod plan_loop;
+pub mod script_memory;
+pub mod summariser;
 
 pub use plan_loop::{requires_plan, LoopError, LoopGuards, PLAN_DIRECTIVE, STATE_BLOCK_MARKER};
+pub use script_memory::{RepairError, ReuseHit, ScriptMemory};
+pub use summariser::{HistorySummariser, Role, SummarisedHistory, SummariserConfig, Turn};
 
 /// The core tools (browser / memory / filesystem / llm / acp_notify) plus
 /// terminate. Each tool handles one call and returns structured output.
