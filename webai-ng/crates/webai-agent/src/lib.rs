@@ -6,7 +6,7 @@
 //! (`script_memory`), long-session compression (`summariser`), and the
 //! assembly runtime (`runtime`) the thin binary delegates to.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use webai_llm::LlmClient;
 use webai_memory::SharedMemoryStore;

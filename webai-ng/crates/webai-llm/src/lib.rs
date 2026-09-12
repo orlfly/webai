@@ -44,7 +44,11 @@ impl ChatRole {
 pub enum Delta {
     Text(String),
     /// A tool-call fragment emitted by the model.
-    ToolCall { id: String, name: String, arguments: String },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 /// LLM errors.

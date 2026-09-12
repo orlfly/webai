@@ -23,8 +23,13 @@ pub enum BridgeError {
 
 /// Whether an action mutates the page and therefore warrants an auto-screenshot.
 fn wants_screenshot(verb: &webai_protocol::BrowserVerb) -> bool {
-    use webai_protocol::BrowserVerb::{Click, Download, Drag, Evaluate, Fill, Hover, Navigate, PressKey};
-    matches!(verb, Click | Download | Drag | Evaluate | Fill | Hover | Navigate | PressKey)
+    use webai_protocol::BrowserVerb::{
+        Click, Download, Drag, Evaluate, Fill, Hover, Navigate, PressKey,
+    };
+    matches!(
+        verb,
+        Click | Download | Drag | Evaluate | Fill | Hover | Navigate | PressKey
+    )
 }
 
 /// The bridge dispatcher (ARCHITECTURE.md §4.8).
@@ -42,7 +47,10 @@ impl Bridge {
     }
 
     /// Dispatch a browser-tool request end to end.
-    pub async fn dispatch(&self, req: &BrowserToolRequest) -> Result<BrowserToolResponse, BridgeError> {
+    pub async fn dispatch(
+        &self,
+        req: &BrowserToolRequest,
+    ) -> Result<BrowserToolResponse, BridgeError> {
         let module = compose(req)?;
         let result = self
             .webkit
@@ -59,7 +67,11 @@ impl Bridge {
         verify_src: String,
         eval: EvaluateResult,
     ) -> Result<BrowserToolResponse, BridgeError> {
-        let ok = eval.json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let ok = eval
+            .json
+            .get("ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let mut response = BrowserToolResponse {
             ok,
             result: Some(eval.json),
@@ -85,8 +97,8 @@ impl Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webai_protocol::BrowserVerb;
     use serde_json::json;
+    use webai_protocol::BrowserVerb;
 
     #[test]
     fn wants_screenshot_marks_mutating_verbs() {
@@ -111,7 +123,11 @@ mod tests {
             screenshot_path: None,
         };
         let resp = bridge
-            .merge(&req, "export const verify=()=>({ok:true})".to_string(), eval)
+            .merge(
+                &req,
+                "export const verify=()=>({ok:true})".to_string(),
+                eval,
+            )
             .await
             .unwrap();
         assert!(resp.ok);
