@@ -17,9 +17,7 @@ fn real_device_launch_and_preflight() {
     let mut bridge = WebkitBridgeCxx::default();
     // Minimal launch against the real backend: must not produce the
     // structured CogLaunch error on a device that has WPE available.
-    bridge
-        .launch()
-        .expect("WPE device launch failed");
+    bridge.launch().expect("WPE device launch failed");
     assert!(bridge.is_launched());
     // Minimal preflight round-trip after launch.
     bridge

@@ -21,6 +21,7 @@ pub use run::{install_panic_hook, run, run_real, LoopSignal, TerminalGuard};
 pub use session::{
     LoopPromptHandler, PromptHandler, SessionBackend, COALESCE_STEP_BURST, EVENT_CHANNEL_CAPACITY,
 };
+pub use webai_protocol::SessionEvent;
 
 /// A command the frontend sends to the session background task.
 #[derive(Debug, Clone)]

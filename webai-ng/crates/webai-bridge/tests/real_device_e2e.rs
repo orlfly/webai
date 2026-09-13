@@ -114,7 +114,10 @@ async fn real_device_full_pipeline() {
         .cloned()
         .unwrap_or_default()
         .to_string();
-    assert!(text.contains("real-wpe"), "get_text must see page text, got {text}");
+    assert!(
+        text.contains("real-wpe"),
+        "get_text must see page text, got {text}"
+    );
 
     // 4. snapshot: href/title/readyState from the real view
     let r = bridge
@@ -129,7 +132,10 @@ async fn real_device_full_pipeline() {
         .cloned()
         .unwrap_or_default()
         .to_string();
-    assert!(snap.contains("e2e-page"), "snapshot must carry title, got {snap}");
+    assert!(
+        snap.contains("e2e-page"),
+        "snapshot must carry title, got {snap}"
+    );
 
     // 5. click via dispatch (injected-args path again)
     let r = bridge
@@ -144,8 +150,16 @@ async fn real_device_full_pipeline() {
         .await
         .expect("screenshot verb must succeed");
     assert!(r.ok, "screenshot verb ok, resp={r:?}");
-    let png = bridge.webkit().screenshot().await.expect("real PNG capture");
-    assert!(png.len() > 100, "PNG must be non-trivial, got {} bytes", png.len());
+    let png = bridge
+        .webkit()
+        .screenshot()
+        .await
+        .expect("real PNG capture");
+    assert!(
+        png.len() > 100,
+        "PNG must be non-trivial, got {} bytes",
+        png.len()
+    );
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "must be a real PNG");
 
     let dir = std::env::temp_dir().join("webai-real-e2e");

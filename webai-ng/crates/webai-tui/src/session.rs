@@ -11,7 +11,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use webai_agent::{AgentSession, ChatMessage};
+use webai_agent::summariser::SummariserConfig as HistoryConfig;
+use webai_agent::{
+    AgentRunner, AgentSession, ChatMessage, HistorySummariser, RunConfig, StepOutcome, ToolExecutor,
+};
+use webai_memory::SharedMemoryStore;
 use webai_protocol::SessionEvent;
 
 use crate::UiCommand;
@@ -34,7 +38,6 @@ pub trait PromptHandler: Send + Sync {
     /// prompt.
     fn run(&self, prompt: &str, emit: &mut dyn FnMut(SessionEvent)) -> Result<(), String>;
 }
-
 
 /// A handle the frontend uses to both observe events and drive the session.
 #[derive(Debug)]
@@ -186,6 +189,88 @@ impl PromptHandler for LoopPromptHandler {
         };
         emit(done);
         Ok(())
+    }
+}
+
+/// Production prompt handler: drives the M4 orchestration driver
+/// (`AgentRunner::run`) for each prompt and emits one `Step` event per
+/// completed step, then a terminal `Done`/`Error`. The executor is injected
+/// (stub in tests; the script/dispatch executor in the binary).
+pub struct RunnerPromptHandler {
+    runner: AgentRunner,
+    llm: std::sync::Arc<webai_llm::LlmClient>,
+    exec: std::sync::Arc<dyn ToolExecutor>,
+}
+
+/// Thread-safe wrapper so `Arc<dyn PromptHandler>` can share one handler.
+pub struct RunnerPromptHandlerShared(pub Arc<RunnerPromptHandler>);
+
+impl PromptHandler for RunnerPromptHandlerShared {
+    fn run(&self, prompt: &str, emit: &mut dyn FnMut(SessionEvent)) -> Result<(), String> {
+        self.0.run(prompt, emit)
+    }
+}
+
+impl RunnerPromptHandler {
+    /// Assemble from the runtime's LLM + memory plus an injected executor.
+    pub fn new(
+        llm: Arc<webai_llm::LlmClient>,
+        memory: SharedMemoryStore,
+        exec: Arc<dyn ToolExecutor>,
+    ) -> Self {
+        Self {
+            runner: AgentRunner::new(
+                RunConfig::default(),
+                memory,
+                HistorySummariser::new(HistoryConfig::default()),
+            ),
+            llm,
+            exec,
+        }
+    }
+
+    fn run(&self, prompt: &str, emit: &mut dyn FnMut(SessionEvent)) -> Result<(), String> {
+        use webai_protocol::AgentStep;
+        // The runner is async but the PromptHandler trait is sync. Never call
+        // `Handle::block_on` here: this runs on a runtime worker thread and
+        // would panic. Shift to the blocking pool instead.
+        let runner = &self.runner;
+        let llm = &self.llm;
+        let exec = Arc::clone(&self.exec);
+        let attempt = tokio::task::block_in_place(|| {
+            // In the runtime context: block on a dedicated handle (safe inside
+            // block_in_place); elsewhere fall back to a fresh runtime.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                Ok(handle.block_on(runner.run(prompt, exec.as_ref(), llm)))
+            } else {
+                tokio::runtime::Runtime::new()
+                    .map(|rt| rt.block_on(runner.run(prompt, exec.as_ref(), llm)))
+                    .map_err(|e| e.to_string())
+            }
+        })
+        .map_err(|e| e.to_string())?;
+        let result = attempt;
+        for step in &result.0 {
+            emit(SessionEvent::Step {
+                step: AgentStep {
+                    tool_name: step.tool_name.clone(),
+                    observation: step.observation.clone(),
+                    image: None,
+                    reused_script: step.reused_script,
+                },
+            });
+        }
+        match &result.1 {
+            StepOutcome::Done { state, message } => {
+                let _ = (state, message);
+                emit(SessionEvent::Done {
+                    state: crate::done_state(Ok(())),
+                });
+                Ok(())
+            }
+            StepOutcome::Guard(err) => Err(format!("guard: {err}")),
+            StepOutcome::Error { code, message } => Err(format!("{code}: {message}")),
+        }
     }
 }
 

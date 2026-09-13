@@ -89,17 +89,15 @@ pub fn bootstrap(config_dir: &Path) -> Result<Runtime, RuntimeError> {
         let mut store = SharedMemoryStore::new();
         if let Some(embd) = config.embedding.as_ref() {
             if !embd.backend.is_empty() {
-                let model = webai_embedding::BgeM3Adapter::new(
-                    webai_embedding::BgeM3Config {
-                        model: if embd.model.is_empty() {
-                            "BAAI/bge-m3".into()
-                        } else {
-                            embd.model.clone()
-                        },
-                        endpoint: embd.endpoint.clone(),
-                        dim: if embd.dim > 0 { embd.dim } else { 1024 },
+                let model = webai_embedding::BgeM3Adapter::new(webai_embedding::BgeM3Config {
+                    model: if embd.model.is_empty() {
+                        "BAAI/bge-m3".into()
+                    } else {
+                        embd.model.clone()
                     },
-                );
+                    endpoint: embd.endpoint.clone(),
+                    dim: if embd.dim > 0 { embd.dim } else { 1024 },
+                });
                 if !store.set_embedder(Arc::new(model)) {
                     tracing::warn!(
                         "embedding adapter dimension mismatch; vector channel keeps placeholder"

@@ -615,8 +615,7 @@ mod tests {
         let close_thread = {
             let d = disp.clone();
             std::thread::spawn(move || {
-                let req =
-                    request("session/close", serde_json::json!({"session_id": "s1"}));
+                let req = request("session/close", serde_json::json!({"session_id": "s1"}));
                 d.dispatch(&req, &mut |_| {})
             })
         };

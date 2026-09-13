@@ -151,11 +151,15 @@ impl Bridge {
         // execute phase reports ok:false by design here; a `needs_rust_load`
         // result is not an error.
         if json_get_bool(&result.json, &["execute", "needs_rust_load"]) {
-            let url = req.args.get("url").and_then(|v| v.as_str()).ok_or_else(
-                || BridgeError::Webkit(WebkitError::ScriptError(
-                    "navigate requested needs_rust_load but args.url is missing".into(),
-                )),
-            )?;
+            let url = req
+                .args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    BridgeError::Webkit(WebkitError::ScriptError(
+                        "navigate requested needs_rust_load but args.url is missing".into(),
+                    ))
+                })?;
             self.webkit.open(url).await?;
             return self.merge_verify_only(req, &module).await;
         }
@@ -232,7 +236,10 @@ impl Bridge {
         let verify = json.get("verify").cloned().unwrap_or_default();
 
         let execute_ok = execute.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
-            || execute.get("needs_rust_load").and_then(|v| v.as_bool()).unwrap_or(false);
+            || execute
+                .get("needs_rust_load")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
         let verify_ok = verify.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         let ok = execute_ok && verify_ok;
 
@@ -416,14 +423,16 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(resp.ok, "navigate must succeed via host-driven load: {:?}", resp.error);
         assert!(
-            !resp
-                .result
-                .as_ref()
-                .map(|r| serde_json::to_string(r).unwrap().contains("EXECUTE_FAILED"))
-                .unwrap_or(false)
+            resp.ok,
+            "navigate must succeed via host-driven load: {:?}",
+            resp.error
         );
+        assert!(!resp
+            .result
+            .as_ref()
+            .map(|r| serde_json::to_string(r).unwrap().contains("EXECUTE_FAILED"))
+            .unwrap_or(false));
     }
 
     #[tokio::test]

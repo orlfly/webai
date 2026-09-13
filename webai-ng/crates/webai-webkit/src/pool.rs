@@ -332,14 +332,20 @@ mod tests {
         });
         let v = pool.acquire("s1").await.unwrap();
         let v2 = v.clone();
-        let h1 =
-            tokio::spawn(
-                async move { v.bridge.evaluate_javascript("1", 1000, None).await.unwrap().json },
-            );
-        let h2 =
-            tokio::spawn(
-                async move { v2.bridge.evaluate_javascript("2", 1000, None).await.unwrap().json },
-            );
+        let h1 = tokio::spawn(async move {
+            v.bridge
+                .evaluate_javascript("1", 1000, None)
+                .await
+                .unwrap()
+                .json
+        });
+        let h2 = tokio::spawn(async move {
+            v2.bridge
+                .evaluate_javascript("2", 1000, None)
+                .await
+                .unwrap()
+                .json
+        });
         let (r1, r2) = tokio::join!(h1, h2);
         // Both complete without panic; the per-view Mutex serializes access.
         assert_eq!(r1.unwrap(), serde_json::json!(42));

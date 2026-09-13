@@ -212,8 +212,9 @@ impl WebkitBridge {
                 .await
             {
                 let href = href.json.as_str().unwrap_or_default().to_owned();
-                if href == url || href.split("://").nth(1).unwrap_or("").split('/').next()
-                    == url.split("://").nth(1).unwrap_or("").split('/').next()
+                if href == url
+                    || href.split("://").nth(1).unwrap_or("").split('/').next()
+                        == url.split("://").nth(1).unwrap_or("").split('/').next()
                 {
                     return Ok(snapshot);
                 }
@@ -261,11 +262,14 @@ impl WebkitBridge {
         // JSON.stringify round-trip in the page guards against any quoting
         // subtleties and keeps the value re-serializable.
         let full_src = match args_json {
-            Some(args) => format!(
-                "window.__webkit_args__ = JSON.parse({});\n",
-                serde_json::to_string(args)
-                    .map_err(|e| WebkitError::ScriptError(format!("args not serializable: {e}")))?
-            ) + src,
+            Some(args) => {
+                format!(
+                    "window.__webkit_args__ = JSON.parse({});\n",
+                    serde_json::to_string(args).map_err(|e| WebkitError::ScriptError(format!(
+                        "args not serializable: {e}"
+                    )))?
+                ) + src
+            }
             None => "window.__webkit_args__ = null;\n".to_owned() + src,
         };
         let payload = backend.evaluate(&full_src, timeout_ms as u32)?;

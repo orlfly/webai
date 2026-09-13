@@ -386,12 +386,9 @@ impl SharedMemoryStore {
             return Vec::new();
         }
         // Vector channel: rank by semantic similarity.
-        let q_values = self.embed_with_model(task).or_else(|| {
-            self.vector
-                .read()
-                .ok()
-                .map(|v| v.embed(task))
-        });
+        let q_values = self
+            .embed_with_model(task)
+            .or_else(|| self.vector.read().ok().map(|v| v.embed(task)));
         let ranked = self
             .vector
             .read()
@@ -518,13 +515,19 @@ mod tests {
         ) -> Result<webai_embedding::Embedding, webai_embedding::EmbeddingError> {
             let lower = text.to_lowercase();
             let mut v = vec![0.0f32; self.dim];
-            for (i, keyword) in ["login", "shopping", "cart", "form", "page"].iter().enumerate() {
+            for (i, keyword) in ["login", "shopping", "cart", "form", "page"]
+                .iter()
+                .enumerate()
+            {
                 if lower.contains(keyword) {
                     v[i % self.dim] += 1.0;
                 }
             }
             v[0] += 0.5; // all docs share a base component
-            Ok(webai_embedding::Embedding { dim: self.dim, values: v })
+            Ok(webai_embedding::Embedding {
+                dim: self.dim,
+                values: v,
+            })
         }
         async fn embed_batch(
             &self,
@@ -578,9 +581,7 @@ mod tests {
         assert!(store_b.set_embedder(Arc::new(LdaLikeModel { dim: 5 })));
         let hits_b = store_b.recall_scripts("shopping cart fill", 2);
         assert!(
-            hits_b
-                .iter()
-                .any(|h| h.task.contains("log in")),
+            hits_b.iter().any(|h| h.task.contains("log in")),
             "cross-session recall must work with the wired model, got {:?}",
             hits_b.iter().map(|h| &h.task).collect::<Vec<_>>()
         );
@@ -599,9 +600,7 @@ mod tests {
         let mut store = SharedMemoryStore::from_config(cfg);
         assert!(!store.set_embedder(Arc::new(LdaLikeModel { dim: 8 })));
         assert!(store.is_available());
-        store
-            .write_script(sample_entry("fill", "log in"))
-            .unwrap();
+        store.write_script(sample_entry("fill", "log in")).unwrap();
         assert_eq!(store.len(), 1);
     }
 

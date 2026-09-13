@@ -23,7 +23,7 @@ parking_lot = { workspace = true }
 
 base64 = "0.22"
 async-trait = { workspace = true }
-
-[dev-dependencies]
 webai-llm = { path = "../webai-llm" }
 webai-memory = { path = "../webai-memory" }
+
+[dev-dependencies]

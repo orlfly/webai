@@ -66,7 +66,14 @@ fn main() {
         }
     }
 
-    match run(mode, public, config_dir.clone(), resume, prompt, resident_secs) {
+    match run(
+        mode,
+        public,
+        config_dir.clone(),
+        resume,
+        prompt,
+        resident_secs,
+    ) {
         Ok(()) => {}
         Err(e) => {
             // Structured, human-readable startup error (no bare "unknown error").
@@ -151,26 +158,98 @@ fn run(
 
     let hooks = runtime::LaunchHooks {
         tui: Box::new(|rt| {
-            // TUI: assemble the shared AgentSession and run the backend run
-            // loop (webai_tui::session::serve). The App is driven from the
-            // SessionEvents; terminal rendering lands with M6-2.
-            let session = webai_agent::AgentSession::new(
-                "local",
-                runtime::build_agent_loop(rt),
-                webai_agent::memory_store(rt),
-            );
-            let handler: Arc<dyn webai_tui::session::PromptHandler> =
-                Arc::new(webai_tui::session::LoopPromptHandler);
-            let backend =
-                webai_tui::session::SessionBackend::spawn(std::sync::Arc::new(session), handler);
-            let runtime =
+            // TUI: run the whole orchestration inside ONE tokio runtime so
+            // `tokio::spawn` in SessionBackend has a reactor context (the
+            // pre-fix panic "there is no reactor running" came from spawning
+            // before the runtime existed).
+            let tui_rt =
                 tokio::runtime::Runtime::new().map_err(|e| RuntimeError::Io(e.to_string()))?;
-            runtime.block_on(async {
-                backend
-                    .close()
-                    .await
-                    .map_err(|e| RuntimeError::Io(e.to_string()))?;
-                Ok::<(), RuntimeError>(())
+            tui_rt.block_on(async {
+                webai_tui::run::install_panic_hook();
+                let mut guard = webai_tui::run::TerminalGuard::enter()
+                    .map_err(|e| RuntimeError::Io(format!("terminal: {e}")))?;
+
+                let session = webai_agent::AgentSession::new(
+                    "local",
+                    runtime::build_agent_loop(rt),
+                    webai_agent::memory_store(rt),
+                );
+                // Real prompt path: the M4 orchestration driver with the same
+                // honest stub executor as headless (script composition drives
+                // the browser verbs; the FFI backend attaches via features).
+                let handler: Arc<dyn webai_tui::session::PromptHandler> = Arc::new(
+                    webai_tui::session::RunnerPromptHandlerShared(Arc::new(
+                        webai_tui::session::RunnerPromptHandler::new(
+                            Arc::clone(&rt.llm),
+                            (*rt.memory).clone(),
+                            Arc::new(webai_agent::runner::StubExecutor::default()),
+                        ),
+                    )),
+                );
+                let mut backend =
+                    webai_tui::session::SessionBackend::spawn(std::sync::Arc::new(session), handler);
+
+                // Relay SessionEvents -> UiEvents for the run loop, and forward
+                // run-loop commands -> backend (send_prompt / shutdown).
+                let (ui_tx, ui_rx) = tokio::sync::mpsc::channel::<webai_tui::UiEvent>(
+                    webai_tui::session::EVENT_CHANNEL_CAPACITY,
+                );
+                // Relay task owns the backend: select over SessionEvents (map
+                // to UiEvents) and forwarded commands (Send / Shutdown) since
+                // SessionBackend's command sender is private.
+                let (hold_tx, mut hold_rx) = tokio::sync::mpsc::unbounded_channel();
+                let relay = tokio::spawn(async move {
+                    loop {
+                        // SessionEvent side.
+                        tokio::select! {
+                            ev = backend.events().recv() => {
+                                let Some(ev) = ev else { break };
+                                let ui = match ev {
+                                    webai_tui::SessionEvent::Step { step } => {
+                                        webai_tui::UiEvent::Delta(match step.observation {
+                                            Some(obs) => format!("[{}] {}", step.tool_name, obs),
+                                            None => format!("[{}]", step.tool_name),
+                                        })
+                                    }
+                                    webai_tui::SessionEvent::Done { state } => {
+                                        webai_tui::UiEvent::Finished(
+                                            state.message.unwrap_or_else(|| state.status),
+                                        )
+                                    }
+                                    webai_tui::SessionEvent::Error { message } => {
+                                        webai_tui::UiEvent::Finished(format!("error: {message}"))
+                                    }
+                                };
+                                if ui_tx.send(ui).await.is_err() { break; }
+                            }
+                            cmd = hold_rx.recv() => {
+                                let Some(cmd) = cmd else { break };
+                                match cmd {
+                                    webai_tui::UiCommand::Send { text } => { backend.send_prompt(text); }
+                                    webai_tui::UiCommand::Shutdown => break,
+                                }
+                            }
+                        }
+                    }
+                    backend // hand ownership back for close()
+                });
+                let res = webai_tui::run::run_real(ui_rx, hold_tx).await;
+                let _ = guard.restore();
+                // Drain cleanly: dropping the run-loop's command sender closes
+                // the relay's command side; the loop then breaks, returns the
+                // backend, and we shut it down and await its exit.
+                if let Ok(b) = relay.await {
+                    let _ = b.shutdown();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        b.close(),
+                    ).await;
+                }
+                // Non-fatal: interactive exit paths (Ctrl+C / Esc) end Ok.
+                match res {
+                    Ok(()) => Ok::<(), RuntimeError>(()),
+                    Err(e) => Err(RuntimeError::Io(format!("tui: {e}"))),
+                }
             })?;
             println!("webai: TUI session loop finished");
             Ok(())
