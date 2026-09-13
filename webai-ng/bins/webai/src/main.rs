@@ -209,6 +209,15 @@ fn run(
                                 let Some(ev) = ev else { break };
                                 let ui = match ev {
                                     webai_tui::SessionEvent::Step { step } => {
+                                        if let Some(b64) = &step.image {
+                                            if ui_tx
+                                                .send(webai_tui::UiEvent::Image(b64.clone()))
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
                                         webai_tui::UiEvent::Delta(match step.observation {
                                             Some(obs) => format!("[{}] {}", step.tool_name, obs),
                                             None => format!("[{}]", step.tool_name),
