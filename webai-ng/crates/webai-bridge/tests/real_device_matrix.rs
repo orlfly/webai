@@ -290,3 +290,113 @@ fn serve_fixture_multi(primary: &'static str, ct: &'static str, items: &'static 
 }
 
 
+
+// ---------------------------------------------------------------------------
+// FR-3 reuse on the matrix chain (Kaneo #106): a repeated prompt through the
+// REAL bridge-backed executor must flip reused_script false -> true with
+// real ScriptMemory recall (links m6_matrix journeys A/B to this device
+// chain). The executor proxies ToolExecutor calls to the bridge running on
+// its own tokio runtime thread.
+// ---------------------------------------------------------------------------
+
+struct BridgeExecutor {
+    tx: std::sync::mpsc::Sender<(String, String, std::sync::mpsc::Sender<(bool, String)>)>,
+}
+
+impl BridgeExecutor {
+    fn spawn(webkit: WebkitBridge) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, String, std::sync::mpsc::Sender<(bool, String)>)>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("executor runtime");
+            let bridge = Bridge::new(webkit);
+            for (verb, args, reply) in rx {
+                let req = webai_protocol::BrowserToolRequest {
+                    verb: serde_json::from_str(&format!("{{\"v\":\"{verb}\"}}"))
+                        .ok()
+                        .map(|v: serde_json::Value| {
+                            serde_json::from_value(v["v"].clone()).unwrap_or(BrowserVerb::Navigate)
+                        })
+                        .unwrap_or(BrowserVerb::Navigate),
+                    args: serde_json::from_str(&args).unwrap_or_default(),
+                };
+                let resp = rt.block_on(bridge.handle_tool_call(&req));
+                match resp {
+                    Ok(r) => {
+                        let _ = reply.send((r.ok, serde_json::to_string(&r.result.unwrap_or_default()).unwrap_or_default()));
+                    }
+                    Err(e) => {
+                        let _ = reply.send((false, format!("bridge error: {e}")));
+                    }
+                }
+            }
+        });
+        Self { tx }
+    }
+}
+
+impl webai_agent::runner::ToolExecutor for BridgeExecutor {
+    fn execute(&self, verb: &str, args: &str) -> (bool, String) {
+        let (rt, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send((verb.to_string(), args.to_string(), rt))
+            .expect("bridge executor thread alive");
+        rx.recv().expect("bridge executor reply")
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires real WPE stack (WAYLAND_DISPLAY=webai-wl, legacy_cpp cog)"]
+async fn real_device_reuse_on_matrix_chain() {
+    let webkit = WebkitBridge::new();
+    assert!(webkit.is_ffi_available(), "WPE FFI must launch");
+    let exec = BridgeExecutor::spawn(webkit);
+
+    // Isolated on-disk store: the default index path (cwd/.webai/vec) would
+    // leak remembered scripts across test runs and flip the first run to
+    // reused_script=true.
+    let mem_dir = std::env::temp_dir().join(format!("webai-matrix-reuse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mem_dir);
+    let store = webai_memory::SharedMemoryStore::from_config(webai_memory::MemoryConfig {
+        index_path: mem_dir.join("vec"),
+        ..Default::default()
+    });
+    let runner = webai_agent::runner::AgentRunner::new(
+        webai_agent::runner::RunConfig {
+            auto_plan_on_multi_step: false,
+            script_memory_enabled: true,
+            ..Default::default()
+        },
+        store.clone(),
+        webai_agent::HistorySummariser::default(),
+    );
+    let llm = webai_llm::LlmClient::with_profile_stub("stub");
+    let prompt = "打开静态页并读取标题";
+
+    // First run: fresh compose, no recall -> reused_script=false.
+    let (steps, outcome, _) = runner.run(prompt, &exec, &llm).await;
+    assert!(matches!(outcome, webai_agent::runner::StepOutcome::Done { .. }));
+    assert!(!steps.is_empty(), "first run must produce steps");
+    assert!(
+        !steps.iter().any(|s| s.reused_script),
+        "first run must compose fresh (reused_script=false everywhere)"
+    );
+
+    // Second run: real recall from the memory store -> reused_script=true.
+    let (steps2, outcome2, _) = runner.run(prompt, &exec, &llm).await;
+    assert!(matches!(outcome2, webai_agent::runner::StepOutcome::Done { .. }));
+    assert!(
+        !steps2.is_empty() && steps2.iter().all(|s| s.reused_script),
+        "second run must reuse remembered scripts (reused_script=true), got {:?}",
+        steps2.iter().map(|s| (s.tool_name.clone(), s.reused_script)).collect::<Vec<_>>()
+    );
+
+    println!(
+        "MATRIX-REUSE: first=fresh({} steps) second=reused({} steps, all reused_script=true)",
+        steps.len(),
+        steps2.len()
+    );
+    let _ = std::fs::remove_dir_all(&mem_dir);
+}

@@ -28,3 +28,6 @@ futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+webai-agent = { path = "../webai-agent" }
+webai-llm = { path = "../webai-llm" }
+webai-memory = { path = "../webai-memory" }
