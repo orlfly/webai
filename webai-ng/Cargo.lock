@@ -2189,6 +2189,7 @@ dependencies = [
  "tracing",
  "webai-bridge",
  "webai-config",
+ "webai-embedding",
  "webai-llm",
  "webai-memory",
  "webai-protocol",
@@ -2269,6 +2270,7 @@ dependencies = [
 name = "webai-memory"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
  "tempfile",

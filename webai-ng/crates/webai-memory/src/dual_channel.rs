@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use webai_embedding::{EmbeddingError, EmbeddingModel};
+
 use serde_json::Value as Json;
 
 /// Kind of a memory-write entry.
@@ -176,6 +178,11 @@ impl VectorIndex {
         self.vectors.insert(id.to_owned(), self.embed(text));
     }
 
+    /// Insert a pre-computed vector (used when a real embedding model is wired).
+    fn insert_vec(&mut self, id: &str, values: Vec<f32>) {
+        self.vectors.insert(id.to_owned(), values);
+    }
+
     /// Deterministic embedding of a text fragment (placeholder for a real
     /// BGE-M3 model; the vector channel is wired to webai-embedding in M4-2).
     fn embed(&self, text: &str) -> Vec<f32> {
@@ -203,9 +210,9 @@ impl VectorIndex {
         }
     }
 
-    /// Rank entry ids by cosine similarity to the query, returning top `limit`.
-    fn recall(&self, query: &str, limit: usize) -> Vec<(String, f32)> {
-        let q = self.embed(query);
+    /// Rank entry ids by cosine similarity to the already-embedded query, top `limit`.
+    fn recall_with_query(&self, q_values: Option<Vec<f32>>, limit: usize) -> Vec<(String, f32)> {
+        let q = q_values.unwrap_or_else(|| self.embed(""));
         let mut scored: Vec<(String, f32)> = self
             .vectors
             .iter()
@@ -224,6 +231,10 @@ pub struct SharedMemoryStore {
     vector: Arc<RwLock<VectorIndex>>,
     config: MemoryConfig,
     disabled: bool,
+    /// Optional real embedding model (M-2 / Kaneo #50). When `None` the
+    /// vector channel's deterministic hash placeholder is used, so stub
+    /// tests stay byte-for-byte reproducible.
+    embedder: Option<Arc<dyn EmbeddingModel>>,
 }
 
 impl SharedMemoryStore {
@@ -245,6 +256,7 @@ impl SharedMemoryStore {
             vector: Arc::new(RwLock::new(VectorIndex::new(config.dim))),
             config: config.clone(),
             disabled: false,
+            embedder: None,
         };
         // Backend-name validity: unknown names degrade up front.
         if !config.backends_supported() {
@@ -271,12 +283,67 @@ impl SharedMemoryStore {
             vector: Arc::new(RwLock::new(VectorIndex::new(1024))),
             config: MemoryConfig::default(),
             disabled: true,
+            embedder: None,
         }
     }
 
     /// Whether the store is usable (not degraded).
     pub fn is_available(&self) -> bool {
         !self.disabled
+    }
+
+    /// Wire a real embedding model (M-2 / Kaneo #50).
+    ///
+    /// Once wired, the vector channel embeds task/verb/url/script text
+    /// through the model (remote `/embeddings` endpoint when configured in
+    /// `embd.toml`, deterministic placeholder otherwise — the adapter
+    /// already encodes that policy). Without a model the store keeps the
+    /// deterministic hash placeholder so stub tests stay reproducible.
+    /// Returns `false` if the model's dimension does not match
+    /// `MemoryConfig::dim` (caller should keep the fallback).
+    pub fn set_embedder(&mut self, model: Arc<dyn EmbeddingModel>) -> bool {
+        if model.dimensions() != self.config.dim {
+            tracing::warn!(
+                model_dim = model.dimensions(),
+                config_dim = self.config.dim,
+                "embedding model dimension mismatch; keeping placeholder embedder"
+            );
+            return false;
+        }
+        self.embedder = Some(model);
+        true
+    }
+
+    /// Embed `text` through the wired real model when present.
+    ///
+    /// The BGE-M3 model is async (reqwest); sync call sites (script memory
+    /// reuse, recall) bridge via `tokio::Handle::current().block_on` when a
+    /// runtime is entered, and fall back to the placeholder otherwise
+    /// (model-build/embedding-failure also degrades to the placeholder with
+    /// a warning — memory must never take the main flow down).
+    fn embed_with_model(&self, text: &str) -> Option<Vec<f32>> {
+        let model = self.embedder.as_ref()?;
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                    tokio::task::block_in_place(|| handle.block_on(model.embed(text)))
+                } else {
+                    return None; // single-thread runtime: cannot block
+                }
+            }
+            Err(_) => return None,
+        };
+        match result {
+            Ok(emb) => Some(emb.values),
+            Err(EmbeddingError::BackendUnavailable(m)) => {
+                tracing::warn!(reason = %m, "embedding backend unavailable; placeholder used");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "embedding failed; placeholder used");
+                None
+            }
+        }
     }
 
     /// Write a script-memory entry with the canonical `script:{verb}` /
@@ -294,10 +361,18 @@ impl SharedMemoryStore {
             .write()
             .map_err(|_| MemoryError::BackendUnavailable("graph lock poisoned".into()))?
             .insert(entry.clone());
+        // Real-model embedding (M-2) when wired; deterministic placeholder
+        // otherwise (or on embedding failure — see embed_with_model).
+        let values = self.embed_with_model(&searchable).unwrap_or_else(|| {
+            self.vector
+                .read()
+                .map(|v| v.embed(&searchable))
+                .unwrap_or_default()
+        });
         self.vector
             .write()
             .map_err(|_| MemoryError::BackendUnavailable("vector lock poisoned".into()))?
-            .insert(&entry.id, &searchable);
+            .insert_vec(&entry.id, values);
         self.persist_index()
     }
 
@@ -308,11 +383,17 @@ impl SharedMemoryStore {
             return Vec::new();
         }
         // Vector channel: rank by semantic similarity.
+        let q_values = self.embed_with_model(task).or_else(|| {
+            self.vector
+                .read()
+                .ok()
+                .map(|v| v.embed(task))
+        });
         let ranked = self
             .vector
             .read()
             .map_err(|_| ())
-            .map(|v| v.recall(task, limit))
+            .map(|v| v.recall_with_query(q_values, limit))
             .unwrap_or_default();
         let graph = self
             .graph
@@ -418,6 +499,108 @@ impl Default for SharedMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic two-dim "model" (M-2 wired-embedder test): vectors
+    /// cluster by shared keyword presence, so recall ranks semantic
+    /// similarity distinctly from the hash placeholder.
+    #[derive(Debug, Clone)]
+    struct LdaLikeModel {
+        dim: usize,
+    }
+    #[async_trait::async_trait]
+    impl webai_embedding::EmbeddingModel for LdaLikeModel {
+        async fn embed(
+            &self,
+            text: &str,
+        ) -> Result<webai_embedding::Embedding, webai_embedding::EmbeddingError> {
+            let lower = text.to_lowercase();
+            let mut v = vec![0.0f32; self.dim];
+            for (i, keyword) in ["login", "shopping", "cart", "form", "page"].iter().enumerate() {
+                if lower.contains(keyword) {
+                    v[i % self.dim] += 1.0;
+                }
+            }
+            v[0] += 0.5; // all docs share a base component
+            Ok(webai_embedding::Embedding { dim: self.dim, values: v })
+        }
+        async fn embed_batch(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<webai_embedding::Embedding>, webai_embedding::EmbeddingError> {
+            let mut out = Vec::new();
+            for t in texts {
+                out.push(self.embed(t).await?);
+            }
+            Ok(out)
+        }
+        fn dimensions(&self) -> usize {
+            self.dim
+        }
+    }
+
+    /// M-2 (Kaneo #50): with a real embedding model wired, `recall_scripts`
+    /// must rank by the model's semantics (a paraphrased task over a
+    /// different task), and the round-trip stays cross-session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wired_embedder_ranking_and_cross_session() {
+        let path = unique_index();
+        let cfg = MemoryConfig {
+            dim: 5,
+            index_path: path.clone(),
+            ..Default::default()
+        };
+        let mut store = SharedMemoryStore::from_config(cfg);
+        assert!(store.set_embedder(Arc::new(LdaLikeModel { dim: 5 })));
+        store
+            .write_script(sample_entry("fill", "log in to shopping site"))
+            .unwrap();
+        store
+            .write_script(sample_entry("click", "browse shopping page"))
+            .unwrap();
+        // Paraphrase of entry 1 must rank entry 1 first.
+        let hits = store.recall_scripts("sign in on my shopping website now", 2);
+        assert!(!hits.is_empty(), "must recall with wired model");
+        assert!(
+            hits[0].task.contains("log in"),
+            "paraphrase must rank the login entry first, got {:?}",
+            hits.iter().map(|h| &h.task).collect::<Vec<_>>()
+        );
+        // Cross-session: a fresh store instance on the same index path.
+        let store_b = SharedMemoryStore::from_config(MemoryConfig {
+            dim: 5,
+            index_path: path.clone(),
+            ..Default::default()
+        });
+        let mut store_b = store_b;
+        assert!(store_b.set_embedder(Arc::new(LdaLikeModel { dim: 5 })));
+        let hits_b = store_b.recall_scripts("shopping cart fill", 2);
+        assert!(
+            hits_b
+                .iter()
+                .any(|h| h.task.contains("log in")),
+            "cross-session recall must work with the wired model, got {:?}",
+            hits_b.iter().map(|h| &h.task).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A model whose dimension does not match the config must be rejected
+    /// and the store keeps working (placeholder), never failing the flow.
+    #[tokio::test]
+    async fn dim_mismatch_rejects_but_store_usable() {
+        let cfg = MemoryConfig {
+            dim: 4,
+            index_path: unique_index(),
+            ..Default::default()
+        };
+        let mut store = SharedMemoryStore::from_config(cfg);
+        assert!(!store.set_embedder(Arc::new(LdaLikeModel { dim: 8 })));
+        assert!(store.is_available());
+        store
+            .write_script(sample_entry("fill", "log in"))
+            .unwrap();
+        assert_eq!(store.len(), 1);
+    }
 
     fn unique_index() -> PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};

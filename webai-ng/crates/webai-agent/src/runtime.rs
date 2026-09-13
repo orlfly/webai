@@ -82,8 +82,32 @@ pub fn bootstrap(config_dir: &Path) -> Result<Runtime, RuntimeError> {
     // LLM profile validated by the config loader (fail-fast on unknown).
     let llm = Arc::new(LlmClient::with_profile_stub(&config.agent.llm));
     // Memory degrades: no mem.toml / backend -> disabled store (main flow runs).
+    // M-2 (Kaneo #50): when embd.toml configures a real embedding backend,
+    // wire the BGE-M3 adapter into the vector channel so semantic recall
+    // uses real model output; backend absent/failed keeps the placeholder.
     let memory = Arc::new(if config.memory.is_some() {
-        SharedMemoryStore::new()
+        let mut store = SharedMemoryStore::new();
+        if let Some(embd) = config.embedding.as_ref() {
+            if !embd.backend.is_empty() {
+                let model = webai_embedding::BgeM3Adapter::new(
+                    webai_embedding::BgeM3Config {
+                        model: if embd.model.is_empty() {
+                            "BAAI/bge-m3".into()
+                        } else {
+                            embd.model.clone()
+                        },
+                        endpoint: embd.endpoint.clone(),
+                        dim: if embd.dim > 0 { embd.dim } else { 1024 },
+                    },
+                );
+                if !store.set_embedder(Arc::new(model)) {
+                    tracing::warn!(
+                        "embedding adapter dimension mismatch; vector channel keeps placeholder"
+                    );
+                }
+            }
+        }
+        store
     } else {
         SharedMemoryStore::disabled()
     });

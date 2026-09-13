@@ -20,3 +20,4 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.14"
+async-trait = { workspace = true }

@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 webai-config = { path = "../webai-config" }
+webai-embedding = { path = "../webai-embedding" }
 webai-protocol = { path = "../webai-protocol" }
 webai-bridge = { path = "../webai-bridge" }
 webai-llm = { path = "../webai-llm" }

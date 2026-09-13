@@ -28,7 +28,7 @@ pub struct EmbeddingHit {
 
 /// Uniform embedding interface (ARCHITECTURE.md §4.4).
 #[async_trait]
-pub trait EmbeddingModel: Send + Sync {
+pub trait EmbeddingModel: Send + Sync + std::fmt::Debug {
     /// Embed a single text fragment.
     async fn embed(&self, text: &str) -> Result<Embedding, EmbeddingError>;
     /// Embed many fragments as a batch.

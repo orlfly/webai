@@ -94,6 +94,9 @@ pub struct EmbeddingConfig {
     pub backend: String,
     pub model: String,
     pub dim: usize,
+    /// OpenAI-compatible `/embeddings` endpoint. Omitted = local placeholder
+    /// (deterministic hash embedding, stub-reproducible).
+    pub endpoint: Option<String>,
 }
 
 /// Memory backend configuration (`mem.toml`).
