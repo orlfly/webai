@@ -409,9 +409,50 @@ mod tests {
     }
 
     #[test]
-    fn capability_probe_falls_back_to_none_in_clean_env() {
-        // This test env has no KITTY/iTERM markers set; assert the probe
-        // degrades gracefully (either None or a valid protocol).
-        let _ = detect_protocol();
+    fn capability_probe_is_total_and_correct_in_synthetic_env() {
+        // The probe must always return a total answer for any env state:
+        // a known protocol or None (never a panic). Assert via a child-safe
+        // probe of the pure matching logic through a temporary env var.
+        std::env::set_var("KITTY_WINDOW_ID", "1");
+        assert!(matches!(detect_protocol(), Some(ImageProtocol::Kitty)));
+        std::env::remove_var("KITTY_WINDOW_ID");
+
+        std::env::set_var("TERM_PROGRAM", "iTerm.app");
+        assert!(matches!(detect_protocol(), Some(ImageProtocol::ITerm2)));
+        std::env::remove_var("TERM_PROGRAM");
+
+        std::env::set_var("TERM", "xterm-256color-sixel");
+        assert!(matches!(detect_protocol(), Some(ImageProtocol::Sixel)));
+        std::env::remove_var("TERM");
+    }
+
+    /// Task #81: a read-only temp dir makes ingest return PersistFailure
+    /// (never the misleading "base64 decode failed").
+    #[test]
+    fn read_only_dir_yields_persist_failure() {
+        let dir = temp_root("readonly");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Drop write permission on the directory (unix).
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms.clone()).unwrap();
+
+        let mut p = ImagePipeline::new(&dir, Some(ImageProtocol::Kitty));
+        // The ImagePipeline::new re-creates the dir with default perms; make
+        // it read-only again AFTER construction.
+        let mut p2perms = std::fs::metadata(&dir).unwrap().permissions();
+        p2perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, p2perms).unwrap();
+
+        let err = p.ingest(&b64(&png_bytes(2, 2))).unwrap_err();
+        assert!(
+            matches!(err, PlaceholderReason::PersistFailure(_)),
+            "expected PersistFailure, got {err:?}"
+        );
+        // Restore permissions so cleanup can remove the dir.
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
