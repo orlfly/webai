@@ -12,7 +12,7 @@ publish.workspace = true
 # Passthrough enabling the real WPE FFI backend (cog + WPE WebKit C++ bridge).
 # Default build stays pure Rust; `--features real_backend` compiles and links
 # the legacy C++ wrapper for real-device runs (§4.7).
-real_backend = ["webai-webkit/legacy_cpp"]
+real_backend = ["webai-webkit/real_ffi"]
 
 [dependencies]
 webai-protocol = { path = "../webai-protocol" }
