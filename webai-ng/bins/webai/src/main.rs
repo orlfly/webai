@@ -66,11 +66,33 @@ fn main() {
         }
     }
 
-    match run(mode, public, config_dir, resume, prompt, resident_secs) {
+    match run(mode, public, config_dir.clone(), resume, prompt, resident_secs) {
         Ok(()) => {}
         Err(e) => {
             // Structured, human-readable startup error (no bare "unknown error").
             eprintln!("webai: {e}");
+            // Cold-start remedy: point at the file to create, only when a
+            // required config file is absent (PRODUCT-DESIGN §7).
+            if matches!(
+                e,
+                RuntimeError::MissingConfig { .. } | RuntimeError::ConfigParse { .. }
+            ) {
+                let dir = config_dir
+                    .as_deref()
+                    .map(|d| d.to_path_buf())
+                    .unwrap_or_else(|| {
+                        webai_config::resolve_config_dir(
+                            std::env::var("WEBAI_CONFIG").ok().as_deref(),
+                        )
+                    });
+                eprintln!(
+                    "hint: create {}/agent.toml (at minimum `llm = \"<profile>\"`)\
+                     \n      and {}/llm.toml (a `[<profile>]` table with model/base_url/endpoint/api_key);\
+                     \n      or pass --config-dir <dir>",
+                    dir.display(),
+                    dir.display()
+                );
+            }
             std::process::exit(1);
         }
     }
