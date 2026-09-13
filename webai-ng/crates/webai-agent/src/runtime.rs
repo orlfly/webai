@@ -241,6 +241,40 @@ pub fn scan_sessions(dir: &Path) -> Vec<PathBuf> {
 /// (schema-validated `{"role", "text"}`); a trailing truncated/invalid line is
 /// skipped (single-line loss is the documented crash-recovery bound). An
 /// invalid line that is *not* at the end of the file is a structured error.
+/// Validate a `--resume <id>` session id (M-5, task #104): the id must be
+/// non-empty, bounded (<=128 chars), free of path separators / traversal
+/// segments / NUL, and restricted to the transcript-id charset
+/// `[A-Za-z0-9._-]`. Returns a structured error otherwise, never a panic.
+pub fn validate_session_id(id: &str) -> Result<(), RuntimeError> {
+    if id.is_empty() {
+        return Err(RuntimeError::ConfigParse {
+            path: std::path::PathBuf::from("<session-id>"),
+            detail: "session id must not be empty".into(),
+        });
+    }
+    if id.len() > 128 {
+        return Err(RuntimeError::ConfigParse {
+            path: std::path::PathBuf::from("<session-id>"),
+            detail: format!("session id too long ({} > 128 bytes)", id.len()),
+        });
+    }
+    if id == "." || id == ".." || id.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err(RuntimeError::ConfigParse {
+            path: std::path::PathBuf::from("<session-id>"),
+            detail: format!("session id must not traverse paths: {id:?}"),
+        });
+    }
+    if id.chars().any(|c| {
+        !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    }) {
+        return Err(RuntimeError::ConfigParse {
+            path: std::path::PathBuf::from("<session-id>"),
+            detail: format!("session id has forbidden characters: {id:?}"),
+        });
+    }
+    Ok(())
+}
+
 /// Returns `(session_id, transcript_lines)` with raw JSONL text preserved.
 pub fn resume_transcript(path: &Path) -> Result<(String, Vec<String>), RuntimeError> {
     let session_id = path
@@ -248,6 +282,7 @@ pub fn resume_transcript(path: &Path) -> Result<(String, Vec<String>), RuntimeEr
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string();
+    validate_session_id(&session_id)?;
     let raw = std::fs::read_to_string(path).map_err(|e| RuntimeError::Io(e.to_string()))?;
     let mut lines = Vec::new();
     let total: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -402,6 +437,29 @@ mod tests {
         assert_eq!(id, "sess-9");
         assert_eq!(lines.len(), 2, "truncated trailing line must be skipped");
         assert!(lines[0].contains("\"role\":\"user\""));
+    }
+
+    #[test]
+    /// #104 / M-5 matrix: session-id validation rejects traversal,
+    /// separators, empties, oversize and foreign charset; accepts real ids.
+    #[test]
+    fn validate_session_id_matrix() {
+        // Accept: a realistic id and the charset corners.
+        for ok in ["sess-01", "a", "A9._-x", "9".repeat(128).as_str()] {
+            validate_session_id(ok).unwrap_or_else(|e| panic!("must accept {ok:?}: {e}"));
+        }
+        // Reject: structured errors, no panics, for every hostile input.
+        for bad in [
+            "", "../escape", "a/../b", "a/b", "a\\b", "..", ".",
+            &"x".repeat(129), "id with space", "id\u{0}nul", "id:colon",
+        ] {
+            let err = validate_session_id(bad)
+                .expect_err(&format!("must reject {bad:?}"));
+            assert!(
+                matches!(err, RuntimeError::ConfigParse { .. }),
+                "structured error required for {bad:?}, got {err:?}"
+            );
+        }
     }
 
     #[test]

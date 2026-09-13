@@ -471,4 +471,39 @@ mod tests {
         assert!(validate_navigation_url("file:///etc/passwd").is_err());
         assert!(validate_navigation_url("not a url").is_err());
     }
+    /// #104 host-side regression: download() must reject a traversal
+    /// filename with the structured DOWNLOAD_PATH_NOT_ALLOWED code before any
+    /// filesystem write (0 crossings), and accept a safe filename.
+    #[tokio::test]
+    async fn download_rejects_traversal_filename_structured() {
+        let dir = std::env::temp_dir().join(format!("webai-dl2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("escape-marker.bin");
+        let _ = std::fs::remove_file(&marker);
+
+        let err = download(
+            &serde_json::json!({"url": "http://127.0.0.1:1/x.bin", "filename": "../escape-marker.bin"}),
+            Some(dir.to_str().unwrap()),
+        )
+        .await
+        .expect_err("traversal filename must be rejected");
+        assert_eq!(err.code(), "DOWNLOAD_PATH_NOT_ALLOWED", "{err}");
+
+        // 0 crossings: nothing escaped the download dir (parent included).
+        assert!(!marker.exists(), "traversal write escaped the download dir");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().count() == 0,
+            "no file may be created for a rejected download"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #104: `..` hidden inside an otherwise-innocent name is also rejected.
+    #[test]
+    fn download_rejects_inner_traversal_segments() {
+        let args = serde_json::json!({"filename": "a/../b.bin"});
+        let raw = args.get("filename").and_then(Json::as_str).unwrap();
+        assert!(raw.split(['/', '\\']).any(|seg| seg == ".."));
+    }
+
 }

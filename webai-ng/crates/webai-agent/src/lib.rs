@@ -25,7 +25,8 @@ pub use runner::{
 };
 pub use runtime::{
     bootstrap, build_agent_loop, check_public_gate, launch, memory_store, resume_transcript,
-    scan_sessions, LaunchHooks, LaunchMode, LaunchOutcome, Runtime, RuntimeError,
+    scan_sessions, validate_session_id, LaunchHooks, LaunchMode, LaunchOutcome, Runtime,
+    RuntimeError,
 };
 pub use sandbox::{PathSandbox, SandboxError};
 pub use script_memory::{RepairError, ReuseHit, ScriptMemory};
