@@ -66,10 +66,23 @@ stub 层全部用例可在 `cargo test` 内以确定性 fake 驱动（已在 bri
 
 可追溯性：每个 FR/指标至少一个用例或一个具名测试；无"孤儿需求"。
 
-## 5. 登记清单（初始为空）
+## 5. 登记清单（真机 T2 首跑，2026-09-13，WPE headless Weston `WAYLAND_DISPLAY=webai-wl`）
 
 | 用例 ID | 失败阶段 | 原因（原文） | 状态 |
 |---|---|---|---|
-| （待真机 CI 首跑填写） | | | |
+| N-S1..N-SN2（21 例） | — | — | 全部一次通过（DEVICE-MATRIX: 21/21，wpe-recoveries=0） |
+| N-E2 | （历史，见注） | WPE 对 ≥ ~16KB evaluate payload 返回 undefined（"Unsupported result type"，WebKitWebView.cpp:4248）并楔死视图；已由 10KiB fail-closed 守卫（webai-webkit evaluate_javascript）结构化拒绝 | 已修复（用例改为断言结构化拒绝且视图存活） |
+| N-AT1 | （历史，见注） | 修复前 generic 容器整棵丢弃子树 → 树仅 1 节点；已修（后代提升 + 标签回退），真机 108 节点（阈值 100） | 已修复 |
+| N-C2 | （历史，见注） | 修复前点击 `[data-captcha]` 内目标未被拦截；已修（CAPTCHA_BLOCK 结构化失败） | 已修复 |
+| N-DL2 | （历史，见注） | 修复前 `..` 文件名被静默净化而非结构化拒绝；已修（DOWNLOAD_PATH_NOT_ALLOWED，0 穿越） | 已修复 |
+
+**本轮环境失败：0**（无镜像/显示/网络类失败，无需 §3 重跑）。
+
+**通过率（M-1 口径）**：21/21 = **100% ≥ 95%**。
+复算：`WAYLAND_DISPLAY=webai-wl XDG_RUNTIME_DIR=/run/user/1000 cargo test -p webai-bridge --features real_backend --test real_device_matrix -- --ignored --exact real_device_matrix_21_cases --nocapture`，取末行 `DEVICE-MATRIX: N/N cases executed (wpe-recoveries=K)`，通过率 = (21−真实失败)/(21−环境失败)。
+
+**FR-3 真机复用补充**：`real_device_reuse_on_matrix_chain`（#106）输出 `MATRIX-REUSE: first=fresh(...) second=reused(..., all reused_script=true)`。
+
+**提交**：bd0d570（矩阵+产品修复）、fc16216（#104）、32bc42a（#106）。
 
 stub 层当前：0 未通过。
