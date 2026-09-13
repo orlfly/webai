@@ -123,11 +123,30 @@ pub struct WebkitBridge {
 }
 
 /// A canned backend for tests: returns scripted responses without WebKit.
-#[derive(Debug, Clone, Default)]
+///
+/// Either a static `evaluate_result` or a dynamic `evaluate_fn` (inspects the
+/// composed source) may be provided; the dynamic form lets a test return
+/// per-verb DOM-model payloads.
+#[derive(Clone, Default)]
 pub struct CannedBackend {
     pub evaluate_result: Option<serde_json::Value>,
     pub screenshot_png: Option<Vec<u8>>,
     pub load_events: Vec<LoadSnapshot>,
+    /// Dynamic scripted evaluator: receives the composed JS source, returns
+    /// the evaluate JSON (or None to fall back to `evaluate_result`).
+    #[allow(clippy::type_complexity)]
+    pub evaluate_fn: Option<Arc<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for CannedBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CannedBackend")
+            .field("evaluate_result", &self.evaluate_result)
+            .field("screenshot_png", &self.screenshot_png)
+            .field("load_events", &self.load_events)
+            .field("evaluate_fn", &self.evaluate_fn.as_ref().map(|_| "fn"))
+            .finish()
+    }
 }
 
 impl WebkitBridge {
@@ -244,6 +263,14 @@ impl WebkitBridge {
     ) -> Result<EvaluateResult, WebkitError> {
         // Canned path (tests).
         if let Some(canned) = self.canned.lock().unwrap().as_ref() {
+            if let Some(fn_) = canned.evaluate_fn.as_ref() {
+                if let Some(json) = fn_(src) {
+                    return Ok(EvaluateResult {
+                        json,
+                        screenshot_path: None,
+                    });
+                }
+            }
             if let Some(json) = canned.evaluate_result.clone() {
                 return Ok(EvaluateResult {
                     json,
