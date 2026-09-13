@@ -86,6 +86,7 @@ jobs:
           export WPE_BACKEND=fdo
           xvfb-run -a cargo test -p webai-bridge --features real_backend --test real_device_matrix -- --ignored --exact real_device_matrix_21_cases --nocapture
           xvfb-run -a cargo test -p webai-bridge --features real_backend --test real_device_matrix -- --ignored --exact real_device_reuse_on_matrix_chain --nocapture
+          xvfb-run -a cargo test -p webai-tui --features real_backend --test screenshot_render -- --ignored --exact screenshot_pipeline_renders_real_device_screenshot --nocapture
           xvfb-run -a cargo test -p webai-bridge --features real_backend --test real_device_e2e -- --ignored --nocapture
 
   ci:

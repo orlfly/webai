@@ -134,7 +134,7 @@ async fn run_inner_with<B: ratatui::backend::Backend>(
     guard: &mut TerminalGuard,
     reader: &mut dyn TermEvents,
 ) -> (IoResult<()>, App) {
-    let mut app = App::default();
+    let mut app = App::new();
     let tick = std::time::Duration::from_millis(RENDER_TICK_MS);
 
     loop {
@@ -155,6 +155,9 @@ async fn run_inner_with<B: ratatui::backend::Backend>(
             }
             Some(Input::Ui(Some(crate::UiEvent::Finished(msg)))) => {
                 app.on_ui_event(&crate::UiEvent::Finished(msg));
+            }
+            Some(Input::Ui(Some(crate::UiEvent::Image(b64)))) => {
+                app.on_image(&b64);
             }
             Some(Input::Ui(None)) => {
                 // Session service channel closed: shut the loop down cleanly.
@@ -339,7 +342,7 @@ mod tests {
     /// into the next frame (streaming integration with #58).
     #[test]
     fn ui_event_delta_appears_in_next_frame() {
-        let mut app = App::default();
+        let mut app = App::new();
         app.on_ui_event(&crate::UiEvent::Delta("你好".into()));
         app.on_ui_event(&crate::UiEvent::Delta("，世界".into()));
         // One assistant line holding the accumulated stream.
@@ -355,7 +358,7 @@ mod tests {
     /// UiEvent::Finished updates the status bar.
     #[test]
     fn ui_event_finished_updates_status() {
-        let mut app = App::default();
+        let mut app = App::new();
         app.on_ui_event(&crate::UiEvent::Finished("done".into()));
         assert_eq!(app.status, "done");
         let rows = app.render_to_buffer(60, 12);
@@ -381,7 +384,7 @@ mod tests {
     /// assertion collapses whitespace before matching.
     #[test]
     fn wide_chars_render_content_assertions() {
-        let mut app = App::default();
+        let mut app = App::new();
         app.push_user("打开财经");
         app.push_assistant("汇总头条");
         let rows = app.render_to_buffer(60, 12);
@@ -396,7 +399,7 @@ mod tests {
     /// Scroll clamps to the content length: Up x1000 cannot exceed it.
     #[test]
     fn scroll_clamps_to_content_length() {
-        let mut app = App::default();
+        let mut app = App::new();
         app.push_assistant("line");
         for _ in 0..1000 {
             app.scroll_up();

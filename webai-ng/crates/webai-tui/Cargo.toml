@@ -8,6 +8,11 @@ license.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# Passthrough for device-level integration tests (screenshot_render): selecting
+# real_backend pulls the bridge/webkit WPE path (used by tests via cfg).
+real_backend = ["dep:webai-bridge", "webai-bridge/real_backend", "dep:webai-webkit", "webai-webkit/real_ffi"]
+
 [dependencies]
 webai-protocol = { path = "../webai-protocol" }
 webai-agent = { path = "../webai-agent" }
@@ -20,10 +25,13 @@ ratatui = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 futures = { workspace = true }
 parking_lot = { workspace = true }
+webai-llm = { path = "../webai-llm" }
+webai-memory = { path = "../webai-memory" }
+webai-bridge = { path = "../webai-bridge", optional = true }
+webai-webkit = { path = "../webai-webkit", optional = true }
 
 base64 = "0.22"
 async-trait = { workspace = true }
-webai-llm = { path = "../webai-llm" }
-webai-memory = { path = "../webai-memory" }
 
 [dev-dependencies]
+tokio = { workspace = true }

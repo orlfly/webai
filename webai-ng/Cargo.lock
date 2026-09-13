@@ -2319,9 +2319,11 @@ dependencies = [
  "tokio",
  "tracing",
  "webai-agent",
+ "webai-bridge",
  "webai-llm",
  "webai-memory",
  "webai-protocol",
+ "webai-webkit",
 ]
 
 [[package]]

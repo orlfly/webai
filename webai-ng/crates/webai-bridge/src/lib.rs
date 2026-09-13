@@ -280,6 +280,48 @@ impl Bridge {
             screenshot_warning: None,
         };
 
+        // Dedicated Screenshot verb: the operation IS the screenshot, so
+        // capture the real PNG and persist it (image_path), consistent with
+        // the auto-screenshot path. Without this the verb returned only page
+        // dimensions and consumers (TUI §4.11 pipeline) had no image bytes.
+        if ok && req.verb == webai_protocol::BrowserVerb::Screenshot {
+            match self.webkit.screenshot().await {
+                Ok(png) if !png.is_empty() => {
+                    let path = std::env::temp_dir()
+                        .join("webai-screenshots")
+                        .join(format!("shot-{}.png", std::process::id()));
+                    if std::fs::create_dir_all(path.parent().unwrap()).is_ok()
+                        && std::fs::write(&path, &png).is_ok()
+                    {
+                        response.image_path = Some(path.to_string_lossy().to_string());
+                    } else {
+                        response.screenshot_warning = Some(BrowserToolError {
+                            code: codes::INTERNAL_ERROR,
+                            message: "screenshot failed to persist".into(),
+                            phase: None,
+                            detail: Some("could not write screenshot PNG to temp dir".into()),
+                        });
+                    }
+                }
+                Ok(_) => {
+                    response.screenshot_warning = Some(BrowserToolError {
+                        code: codes::INTERNAL_ERROR,
+                        message: "screenshot returned empty bytes".into(),
+                        phase: None,
+                        detail: None,
+                    });
+                }
+                Err(e) => {
+                    response.screenshot_warning = Some(BrowserToolError {
+                        code: codes::INTERNAL_ERROR,
+                        message: "screenshot capture failed".into(),
+                        phase: None,
+                        detail: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+
         // Auto-screenshot after every successful non-screenshot/download
         // operation (FR-2 / ARCHITECTURE.md §4.8). A screenshot failure does
         // NOT roll back the operation, but must be surfaced structurally.
@@ -546,18 +588,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn screenshot_verb_does_not_trigger_nested_screenshot() {
-        // Screenshot verb: the operation itself is the screenshot, so no
-        // nested auto-screenshot should run.
+    async fn screenshot_verb_persists_its_own_png_once() {
+        // Screenshot verb: the operation IS the screenshot, so merge persists
+        // the real PNG through image_path exactly once (no nested
+        // auto-screenshot duplication).
         let bridge = Bridge::new(canned_bridge_with_png());
         let resp = bridge
             .handle_tool_call(&req(BrowserVerb::Screenshot, json!({})))
             .await
             .unwrap();
         assert!(resp.ok);
+        let path = resp
+            .image_path
+            .expect("dedicated screenshot must persist its PNG");
+        let bytes = std::fs::read(&path).expect("persisted PNG readable");
+        assert!(bytes.starts_with(b"\x89PNG"), "persisted screenshot is a PNG");
         assert!(
-            resp.image_path.is_none(),
-            "no nested screenshot for screenshot verb"
+            resp.screenshot_warning.is_none(),
+            "no warning on a successful capture: {:?}",
+            resp.screenshot_warning
         );
     }
 

@@ -45,6 +45,14 @@ pub enum KeyAction {
 pub enum ChatLine {
     User(String),
     Assistant(String),
+    /// A rendered terminal image frame (§4.11): protocol, dimensions and the
+    /// persisted temp path; real backends emit the encoded escape sequence.
+    Image {
+        protocol: &'static str,
+        width: u32,
+        height: u32,
+        temp_path: String,
+    },
 }
 
 /// The TUI app state (testable without a terminal).
@@ -61,11 +69,35 @@ pub struct App {
     pub status: String,
     /// Whether the last render should be refreshed (streaming tick).
     pub dirty: bool,
+    /// §4.11 image pipeline: decode-once / dispatch-once ingest of step images.
+    pub images: crate::images::ImagePipeline,
+}
+
+impl Default for crate::images::ImagePipeline {
+    fn default() -> Self {
+        Self::new(std::env::temp_dir().join("webai-tui-imgs"), None)
+    }
 }
 
 impl App {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_protocol(crate::images::detect_protocol())
+    }
+
+    /// Build the app with an explicit image protocol override (tests use a
+    /// deterministic protocol instead of terminal capability detection).
+    pub fn with_protocol(protocol: Option<crate::images::ImageProtocol>) -> Self {
+        Self {
+            lines: Vec::new(),
+            input: String::new(),
+            scroll: 0,
+            status: String::new(),
+            dirty: false,
+            images: crate::images::ImagePipeline::new(
+                std::env::temp_dir().join("webai-tui-imgs"),
+                protocol,
+            ),
+        }
     }
 
     /// Feed one streaming text delta: append to the last assistant line (or
@@ -99,11 +131,67 @@ impl App {
         self.dirty = true;
     }
 
+    /// Ingest one step image (base64 PNG) through the §4.11 pipeline and
+    /// append a transcript marker line. Real terminals receive the encoded
+    /// escape frame from the run loop via [`Self::last_encoded_frame`].
+    pub fn on_image(&mut self, base64_png: &str) {
+        let outcome = match self.images.ingest(base64_png) {
+            Ok(img) => self.images.on_viewport(img.id, true),
+            Err(reason) => {
+                self.lines.push(ChatLine::Assistant(format!(
+                    "[image placeholder: {reason:?}]"
+                )));
+                self.dirty = true;
+                return;
+            }
+        };
+        match outcome {
+            Some(crate::images::DispatchOutcome::Frame { protocol, temp_path, width, height }) => {
+                self.lines.push(ChatLine::Image {
+                    protocol: protocol.as_str(),
+                    width,
+                    height,
+                    temp_path: temp_path.display().to_string(),
+                });
+            }
+            Some(crate::images::DispatchOutcome::Placeholder { reason }) => {
+                self.lines
+                    .push(ChatLine::Assistant(format!("[image placeholder: {reason}]")));
+            }
+            None => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Encode the newest dispatched frame for the active terminal protocol
+    /// (the run loop prints this to the real tty right after a render tick).
+    pub fn last_encoded_frame(&mut self) -> Option<Vec<u8>> {
+        let frame = self.lines.iter().rev().find_map(|l| match l {
+            ChatLine::Image { temp_path, .. } => std::fs::read(temp_path).ok().map(|b| {
+                (
+                    crate::encoders::encode_frame(
+                        &crate::images::DispatchOutcome::Frame {
+                            protocol: crate::images::ImageProtocol::Kitty,
+                            temp_path: std::path::PathBuf::from(temp_path),
+                            width: 0,
+                            height: 0,
+                        },
+                        &b,
+                    ),
+                    b,
+                )
+            }),
+            _ => None,
+        });
+        frame.and_then(|(enc, _)| enc).map(|e| e.bytes)
+    }
+
     /// Consume one frontend `UiEvent` (run-loop integration): a streaming
     /// delta is appended to the current assistant line, a Finished message
     /// updates the status bar.
     pub fn on_ui_event(&mut self, ev: &crate::UiEvent) {
         match ev {
+            crate::UiEvent::Image(b64) => self.on_image(b64),
             crate::UiEvent::Delta(text) => self.push_stream_delta(text),
             crate::UiEvent::Finished(msg) => self.set_status(msg),
         }
@@ -241,6 +329,12 @@ fn render_frame(f: &mut Frame, app: &App) {
         .map(|l| match l {
             ChatLine::User(t) => ListItem::new(RtLine::from(format!("你: {t}"))),
             ChatLine::Assistant(t) => ListItem::new(RtLine::from(format!("AI: {t}"))),
+            ChatLine::Image { protocol, width, height, temp_path } => {
+                ListItem::new(RtLine::from(format!(
+                    "[image {protocol} {width}x{height} {}]",
+                    temp_path
+                )))
+            }
         })
         .collect();
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title("会话"));
@@ -381,4 +475,22 @@ mod tests {
     fn render_tick_constant_is_50ms() {
         assert_eq!(RENDER_TICK_MS, 50);
     }
+
+    #[test]
+    fn image_step_renders_marker_line_in_buffer() {
+        let mut app = App::with_protocol(Some(crate::images::ImageProtocol::Kitty));
+        // 1x1 PNG (same payload as the e2e deterministic case).
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        app.on_image(b64);
+        let rows = app.render_to_buffer(80, 24);
+        assert!(
+            rows.iter().any(|r| r.contains("[image kitty")),
+            "image marker line must render in the terminal buffer: {rows:?}"
+        );
+        // Encoded frame for the real tty exists and is Kitty-shaped.
+        let frame = app.last_encoded_frame().expect("encoded frame");
+        assert!(!frame.is_empty());
+        assert_eq!(frame[0], 0x1B, "escape sequence starts the frame");
+    }
+
 }

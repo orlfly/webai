@@ -8,6 +8,7 @@
 //! image pipeline (decode-once, viewport dispatch, degradation).
 
 pub mod app;
+pub mod encoders;
 pub mod images;
 pub mod run;
 pub mod session;
@@ -38,6 +39,9 @@ pub enum UiCommand {
 pub enum UiEvent {
     /// Streaming text delta appended to the transcript.
     Delta(String),
+    /// A step produced an image (base64 PNG) to be rendered in the terminal
+    /// via the §4.11 image pipeline (decode-once, dispatch-once, encode).
+    Image(String),
     /// The loop finished with a terminal state message.
     Finished(String),
 }
