@@ -284,6 +284,17 @@ impl WebkitBridge {
                 "no FFI environment; cannot evaluate_javascript in stub mode".into(),
             )
         })?;
+        // Real-WPE guard (Kaneo #103, M-4): evaluating a script whose source
+        // exceeds ~12 KiB makes WPE return "Unsupported result type" AND
+        // permanently wedges the view (every later evaluate/screenshot fails).
+        // Fail closed, structurally, before touching the view.
+        const MAX_EVAL_SRC_BYTES: usize = 10 * 1024;
+        let total = src.len() + args_json.map(str::len).unwrap_or(0);
+        if total > MAX_EVAL_SRC_BYTES {
+            return Err(WebkitError::ScriptError(format!(
+                "script too large: {total} bytes (max {MAX_EVAL_SRC_BYTES}); split the evaluation"
+            )));
+        }
         // Prologue: bind `window.__webkit_args__` for this call only. The args
         // JSON is produced by `webai-script::args_injection` (valid JSON); a
         // JSON.stringify round-trip in the page guards against any quoting

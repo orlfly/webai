@@ -174,8 +174,15 @@ fn compose_navigate(args: &Json) -> Result<(String, String), ScriptError> {
 
 fn compose_click(args: &Json) -> Result<(String, String), ScriptError> {
     let _ = require_string(args, "selector", BrowserVerb::Click)?;
+    // V4 captcha-front (e2e-test-matrix N-C2): any click whose target sits
+    // inside a [data-captcha] front is intercepted fail-closed with a
+    // structured error (never "unknown error").
     let execute = r#"const el = document.querySelector(args.selector);
   if (!el) return { ok: false, stage: "execute", error: "element not found", selector: args.selector };
+  const front = el.closest('[data-captcha]');
+  if (front) {
+    return { ok: false, stage: "execute", error: "captcha intercept: action blocked on captcha-front", code: "CAPTCHA_BLOCK", selector: args.selector };
+  }
   el.click();
   return { ok: true, stage: "execute", tag: el.tagName.toLowerCase() };"#.to_owned();
     let verify = r#"const el = document.querySelector(args.selector);
@@ -284,21 +291,42 @@ fn compose_screenshot(args: &Json) -> Result<(String, String), ScriptError> {
 }
 
 fn compose_accessibility_tree() -> Result<(String, String), ScriptError> {
-    let execute = r#"if (typeof WebkitAiAccessibility === 'undefined') {
-    return { ok: true, stage: "execute", tree: { role: 'document', name: document.title, children: [] } };
-  }
+    // N-AT1: the walk must not drop entire subtrees when a generic container
+    // (e.g. div#rows) is filtered: hoist usable descendants instead. When the
+    // WebkitAiAccessibility bundle is absent, fall back to a per-tag role map
+    // rather than collapsing to a single document node.
+    let execute = r#"const ROLE_TAGS = { a: 'link', button: 'button', input: 'textbox', textarea: 'textbox', select: 'combobox', h1: 'heading', h2: 'heading', h3: 'heading', h4: 'heading', h5: 'heading', h6: 'heading', img: 'image', nav: 'navigation', main: 'main', header: 'banner', footer: 'contentinfo', section: 'region', form: 'form', label: 'label', option: 'option', li: 'listitem', ul: 'list', ol: 'list', table: 'table', tr: 'row', td: 'cell', th: 'columnheader' };
+  const getRole = (el) => {
+    if (typeof WebkitAiAccessibility !== 'undefined') {
+      const r = WebkitAiAccessibility.getRole(el);
+      if (r) return r;
+    }
+    const t = el.tagName.toLowerCase();
+    const aria = el.getAttribute('role');
+    if (aria) return aria;
+    return ROLE_TAGS[t] || 'generic';
+  };
+  const getName = (el) => {
+    if (typeof WebkitAiAccessibility !== 'undefined') return WebkitAiAccessibility.computeAccessibleName(el);
+    return el.getAttribute('aria-label') || (el.id ? '#' + el.id : '');
+  };
   const walk = (node) => {
     if (!node || node.nodeType !== 1) return null;
-    const role = WebkitAiAccessibility.getRole(node);
-    const name = WebkitAiAccessibility.computeAccessibleName(node);
-    if ((!role || role === 'generic') && !name) return null;
+    const role = getRole(node);
+    const name = getName(node);
+    if ((!role || role === 'generic') && !name) {
+      // Generic container: do not drop the subtree; hoist usable children.
+      return Array.prototype.slice.call(node.children || []).map(walk).filter(Boolean).flat(9);
+    }
     return {
       tag: node.tagName.toLowerCase(),
       role, name,
-      children: Array.prototype.slice.call(node.children || []).map(walk).filter(Boolean),
+      children: Array.prototype.slice.call(node.children || []).map(walk).filter(Boolean).flat(9),
     };
   };
-  const tree = walk(document.body) || { role: 'document', name: document.title, children: [] };
+  const raw = walk(document.body) || [];
+  const kids = Array.isArray(raw) ? raw : [raw];
+  const tree = { role: 'document', name: document.title, children: kids };
   return { ok: true, stage: "execute", tree };"#
         .to_owned();
     let verify = r#"const ok = !!document.body;

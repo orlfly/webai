@@ -30,6 +30,8 @@ pub enum DownloadError {
     ReadFailed { url: String, err: String },
     #[error("failed to write {path}: {err}")]
     WriteFailed { path: String, err: String },
+    #[error("path traversal in filename {0:?} (PATH_NOT_ALLOWED)")]
+    PathNotAllowed(String),
 }
 
 impl DownloadError {
@@ -44,6 +46,7 @@ impl DownloadError {
             DownloadError::HttpStatus { .. } => "DOWNLOAD_HTTP_STATUS",
             DownloadError::ReadFailed { .. } => "DOWNLOAD_READ_FAILED",
             DownloadError::WriteFailed { .. } => "DOWNLOAD_WRITE_FAILED",
+            DownloadError::PathNotAllowed(_) => "DOWNLOAD_PATH_NOT_ALLOWED",
         }
     }
 }
@@ -242,6 +245,14 @@ pub async fn download(
         dir: directory.display().to_string(),
         err: e.to_string(),
     })?;
+
+    // An explicitly requested filename must not attempt traversal: reject
+    // with a structured error (N-DL2) instead of silently sanitising.
+    if let Some(raw) = args.get("filename").and_then(Json::as_str) {
+        if raw.split(['/', '\\']).any(|seg| seg == "..") {
+            return Err(DownloadError::PathNotAllowed(raw.to_owned()));
+        }
+    }
 
     // Resolve a file name: explicit arg, else the URL path's last segment.
     let filename = args

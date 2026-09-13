@@ -173,3 +173,4 @@ async fn real_device_full_pipeline() {
         png.len()
     );
 }
+

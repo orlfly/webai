@@ -462,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_unknown_method_returns_method_not_found() {
-        let bridge = Bridge::new(WebkitBridge::new());
+        let bridge = Bridge::new(WebkitBridge::with_canned(Default::default()));
         let req = Request {
             id: 1,
             method: "bogus".into(),
@@ -476,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_missing_verb_returns_invalid_params() {
-        let bridge = Bridge::new(WebkitBridge::new());
+        let bridge = Bridge::new(WebkitBridge::with_canned(Default::default()));
         let req = Request {
             id: 2,
             method: "bridge.tool".into(),
@@ -564,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn download_verb_does_not_trigger_nested_screenshot() {
         // Download is Rust-side; no auto-screenshot.
-        let bridge = Bridge::new(WebkitBridge::new());
+        let bridge = Bridge::new(WebkitBridge::with_canned(Default::default()));
         let resp = bridge
             .handle_tool_call(&req(
                 BrowserVerb::Download,

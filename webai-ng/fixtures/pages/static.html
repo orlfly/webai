@@ -48,6 +48,20 @@
       <section class="row"><h2>Section 24</h2><p>Text 24</p><a href="#24">Link 24</a><button data-i="24">Btn 24</button></section>
       <section class="row"><h2>Section 25</h2><p>Text 25</p><a href="#25">Link 25</a><button data-i="25">Btn 25</button></section>
     </div>
+
+  <!-- V3 authed segment: local login form (e2e matrix N-F2/N-S2). -->
+  <form id="login-form" onsubmit="return false;">
+    <input id="user" type="text" placeholder="user">
+    <input id="pass" type="password" placeholder="pass">
+    <button id="login-btn" type="button">login</button>
+    <p id="login-state" data-authed="false">guest</p>
+  </form>
+  <!-- V4 captcha-front intercept segment (e2e matrix N-C2). -->
+  <button id="captcha-btn" data-captcha="1">captcha</button>
+  <div id="captcha-wall" hidden>verify you are human</div>
+  <!-- N-H1/N-D1 hooks. -->
+  <div id="drag-src" draggable="true">drag-a</div>
+  <div id="drag-dst">drop-b</div>
     <footer><p id="foot">25 sections x 5 nodes = 125+ DOM nodes.</p></footer>
   </main>
 </body>
