@@ -30,6 +30,52 @@ env:
   WORKSPACE: webai-ng
 
 jobs:
+  # legacy_cpp opt-in path (task #82 / review #33 Major-2): the C++ bridge
+  # build runs in a container with the WPE / WebKit dev libraries and is
+  # allowed to fail independently of the default Rust-only job (§11 dual
+  # path). The smoke test is feature-gated and runs with `--ignored`.
+  legacy_cpp:
+    name: legacy_cpp • cxx bridge build + real-device smoke
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm-slim
+    defaults:
+      run:
+        working-directory: ${{ env.WORKSPACE }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install toolchain + WPE/WebKit dev libraries
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang \
+            curl python3 \
+            libwpewebkit-1.0-3 libwpewebkit-1.0-dev \
+            libwpe-1.0-1 libwpe-1.0-dev \
+            libegl1-mesa-dev
+          # rustup (stable) — the container has no preinstalled Rust.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.WORKSPACE }}
+
+      - name: Build bridge-cxx with legacy_cpp
+        run: cargo build -p webai-bridge-cxx --features legacy_cpp
+
+      - name: Unit tests (legacy_cpp)
+        run: cargo test -p webai-bridge-cxx --features legacy_cpp
+
+      # Real-device smoke: launch + evaluate the minimal path against the
+      # actual WPE backend inside this container. `--ignored` gates it away
+      # from the default (FFI-less) runs.
+      - name: Real-device smoke test (--ignored)
+        run: cargo test -p webai-bridge-cxx --features legacy_cpp --test real_device_smoke -- --ignored --nocapture
+
   ci:
     name: layering • deny • no-default-features
     runs-on: ubuntu-latest

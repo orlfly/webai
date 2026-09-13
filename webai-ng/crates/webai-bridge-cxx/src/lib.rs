@@ -335,8 +335,9 @@ fn load_trampoline(uri: *const c_char, title: *const c_char, status: i32) {
 mod tests {
     use super::*;
 
-    // These tests assert the no-FFI (default) behaviour: every operation
-    // returns CogLaunch. They only apply when `legacy_cpp` is disabled.
+    // Rust-only (no legacy_cpp) builds surface the structured CogLaunch
+    // error; with the feature on, launch succeeds (that path has its own
+    // --ignored real-device smoke test).
     #[cfg(not(feature = "legacy_cpp"))]
     #[test]
     fn default_build_returns_cog_launch_error_on_launch() {
@@ -348,7 +349,14 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "legacy_cpp"))]
+    #[cfg(feature = "legacy_cpp")]
+    #[test]
+    fn legacy_cpp_build_launches_successfully() {
+        let mut bridge = WebkitBridgeCxx::default();
+        bridge.launch().expect("legacy_cpp launch must succeed");
+        assert!(bridge.is_launched());
+    }
+
     #[test]
     fn preflight_requires_launched_view() {
         let bridge = WebkitBridgeCxx::default();
