@@ -428,10 +428,8 @@ mod tests {
 
     #[tokio::test]
     async fn needs_rust_load_missing_url_is_structured_error() {
-        let bridge = Bridge::new(canned_bridge(true, true));
-        // Force navigate with an args payload lacking url — compose would
-        // reject it before dispatch, so exercise the guard through
-        // json_get_bool's path only via a direct canned execute flag.
+        // No bridge needed: compose rejects url-less args before dispatch,
+        // so exercise json_get_bool's needs_rust_load path directly.
         assert!(!json_get_bool(&json!({}), &["execute", "needs_rust_load"]));
         assert!(json_get_bool(
             &json!({ "execute": { "needs_rust_load": true } }),

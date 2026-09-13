@@ -174,6 +174,9 @@ impl VectorIndex {
         }
     }
 
+    /// Placeholder-text insertion for the stub path; the wired-embedder path
+    /// uses `insert_vec` instead.
+    #[allow(dead_code)]
     fn insert(&mut self, id: &str, text: &str) {
         self.vectors.insert(id.to_owned(), self.embed(text));
     }
