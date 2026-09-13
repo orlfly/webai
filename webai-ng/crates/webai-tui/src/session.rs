@@ -35,29 +35,6 @@ pub trait PromptHandler: Send + Sync {
     fn run(&self, prompt: &str, emit: &mut dyn FnMut(SessionEvent)) -> Result<(), String>;
 }
 
-/// Production prompt handler: turns a user prompt into a single completed
-/// step. This is what the bin wires into the TUI backend (no live model in the
-/// TUI loop; the ACP/headless paths drive the real agent loop).
-#[derive(Debug, Default)]
-pub struct LoopPromptHandler;
-
-impl PromptHandler for LoopPromptHandler {
-    fn run(&self, prompt: &str, emit: &mut dyn FnMut(SessionEvent)) -> Result<(), String> {
-        use webai_protocol::AgentStep;
-        let step = AgentStep {
-            tool_name: "prompt".into(),
-            observation: Some(prompt.to_owned()),
-            image: None,
-            reused_script: false,
-        };
-        emit(SessionEvent::Step { step });
-        let done = SessionEvent::Done {
-            state: crate::done_state(Ok(())),
-        };
-        emit(done);
-        Ok(())
-    }
-}
 
 /// A handle the frontend uses to both observe events and drive the session.
 #[derive(Debug)]

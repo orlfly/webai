@@ -104,8 +104,27 @@ fn session(id: &str, memory: Arc<SharedMemoryStore>) -> Arc<AgentSession> {
     Arc::new(AgentSession::new(id, loop_, memory))
 }
 
+fn fresh_memory() -> Arc<SharedMemoryStore> {
+    // Hermetic: point the persisted-index path at a unique temp dir so the
+    // store never reopens a stale `.webai/vec` left by a previous binary run
+    // (which would make "first use" recall hit old entries).
+    let dir = std::env::temp_dir().join(format!(
+        "webai-m6-mem-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let cfg = webai_memory::MemoryConfig {
+        index_path: dir,
+        ..webai_memory::MemoryConfig::default()
+    };
+    Arc::new(SharedMemoryStore::from_config(cfg))
+}
+
 fn loop_dispatcher(sid: &str) -> (AcpSessionRegistry, Dispatcher, Arc<SharedMemoryStore>) {
-    let memory = Arc::new(SharedMemoryStore::new());
+    let memory = fresh_memory();
     let reg = AcpSessionRegistry::new();
     reg.register(session(sid, memory.clone()));
     let disp = Dispatcher::new(reg, Arc::new(LoopHandler::new(memory.clone())));
@@ -169,7 +188,7 @@ fn journey_b_repeat_marks_reused_script() {
 #[test]
 fn journey_c_failure_is_structured() {
     let reg = AcpSessionRegistry::new();
-    reg.register(session("jc", Arc::new(SharedMemoryStore::new())));
+    reg.register(session("jc", fresh_memory()));
     let disp = Dispatcher::new(reg, Arc::new(ErrHandler));
     let req = AcpRequest {
         id: 3,
