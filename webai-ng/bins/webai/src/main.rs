@@ -129,21 +129,26 @@ fn run(
 
     let hooks = runtime::LaunchHooks {
         tui: Box::new(|rt| {
-            // TUI: assemble the shared AgentSession and run the backend run
-            // loop (webai_tui::session::serve). The App is driven from the
-            // SessionEvents; terminal rendering lands with M6-2.
-            let session = webai_agent::AgentSession::new(
-                "local",
-                runtime::build_agent_loop(rt),
-                webai_agent::memory_store(rt),
-            );
-            let handler: Arc<dyn webai_tui::session::PromptHandler> =
-                Arc::new(webai_tui::session::LoopPromptHandler);
-            let backend =
-                webai_tui::session::SessionBackend::spawn(std::sync::Arc::new(session), handler);
-            let runtime =
+            // TUI: assemble the shared AgentSession and run the backend session
+            // loop (webai_tui::session::serve). `SessionBackend::spawn` uses
+            // `tokio::spawn`, so a Tokio reactor must be live BEFORE we call it
+            // (previously the runtime was built after spawn -> "no reactor
+            // running" panic). Build the runtime first, then spawn inside
+            // `block_on`.
+            let tokio_rt =
                 tokio::runtime::Runtime::new().map_err(|e| RuntimeError::Io(e.to_string()))?;
-            runtime.block_on(async {
+            tokio_rt.block_on(async {
+                let session = webai_agent::AgentSession::new(
+                    "local",
+                    runtime::build_agent_loop(rt),
+                    webai_agent::memory_store(rt),
+                );
+                let handler: Arc<dyn webai_tui::session::PromptHandler> =
+                    Arc::new(webai_tui::session::LoopPromptHandler);
+                let backend = webai_tui::session::SessionBackend::spawn(
+                    std::sync::Arc::new(session),
+                    handler,
+                );
                 backend
                     .close()
                     .await
