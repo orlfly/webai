@@ -81,7 +81,7 @@ futures = "0.3"
 
 # TUI (bins/webai + webai-tui)
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 
 # WebSocket / JSON-RPC server (webai-acp)
 tokio-tungstenite = { version = "0.26", features = ["__rustls-tls", "native-tls"] }

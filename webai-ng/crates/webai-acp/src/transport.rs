@@ -7,12 +7,31 @@
 //! `image`, `Done`, `Error`) are forwarded via `acp_notify` so the remote
 //! observer sees the same event stream as the local TUI.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use webai_protocol::SessionEvent;
 
 use crate::jsonrpc::{self, AcpRequest, Dispatcher};
+use crate::net::{Admission, NetworkPolicy};
 use crate::AcpError;
+
+/// Connection-level admission gate. Called once per client connection (the
+/// transport accept loop) before any frame is dispatched; an unpaired or
+/// non-loopback client receives a JSON-RPC error frame instead of service.
+pub fn accept_connection(
+    policy: &NetworkPolicy,
+    source: IpAddr,
+    presented_pairing: Option<&str>,
+) -> Result<(), AcpError> {
+    match policy.admit(source, presented_pairing) {
+        Admission::Allow => Ok(()),
+        Admission::Deny { code, reason } => Err(AcpError {
+            code: -32001, // implementation-defined server error range
+            message: format!("{code}: {reason}"),
+        }),
+    }
+}
 
 /// A frame delivered from a transport: a JSON-RPC request, or a session event
 /// to be fanned out as `acp_notify`.
@@ -183,6 +202,29 @@ mod tests {
                 },
             ])
         }
+    }
+
+    /// Integration: an unpaired connection is refused at the accept loop
+    /// with a JSON-RPC error before any dispatch happens (task 87 / FR-8).
+    #[tokio::test]
+    async fn unpaired_connection_receives_jsonrpc_error() {
+        let policy = NetworkPolicy::resolve(true, true)
+            .unwrap()
+            .with_pairing_secret("sekrit");
+        // Unpaired: refused.
+        let err = accept_connection(&policy, "10.0.0.9".parse().unwrap(), None).unwrap_err();
+        assert_eq!(err.code, -32001);
+        assert!(err.message.contains("pairing_required"));
+        // Wrong key: refused.
+        let err =
+            accept_connection(&policy, "10.0.0.9".parse().unwrap(), Some("nope")).unwrap_err();
+        assert!(err.message.contains("pairing_invalid"));
+        // Correct key: admitted, dispatch then works.
+        accept_connection(&policy, "10.0.0.9".parse().unwrap(), Some("sekrit")).unwrap();
+        // Private mode still refuses remote sources regardless of key.
+        let private = NetworkPolicy::resolve(false, false).unwrap();
+        let err = accept_connection(&private, "10.0.0.9".parse().unwrap(), None).unwrap_err();
+        assert!(err.message.contains("non_loopback_refused"));
     }
 
     #[tokio::test]

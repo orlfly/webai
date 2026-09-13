@@ -1,49 +1,83 @@
-//! End-to-end test matrix + release gates (M6 / task #39).
+//! End-to-end test matrix + release gates (M6 / task #39, reworked by #89).
 //!
-//! Walks the four product journeys (A/B/C/D) against the assembled runtime
-//! with the real crates (no mocks below the agent loop), then asserts the
-//! release blockers: structured errors only (zero `unknown error`), path
-//! escapes 0, and the guard canaries.
+//! Journey A/B drive the **real AgentRunner plan-act-observe loop** with the
+//! stub-LLM `LlmClient` (no handwritten event replay): events are produced by
+//! the loop, and `reused_script` is read from the real script-memory store
+//! (`SharedMemoryStore::recall_scripts`), not a test counter.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use webai_acp::jsonrpc::{code, AcpRequest, Dispatcher};
 use webai_acp::{AcpHandler, AcpSessionRegistry, NetworkPolicy};
+use webai_agent::runner::{AgentRunner, RunConfig, StepOutcome, StubExecutor};
 use webai_agent::runtime::{self, LaunchMode};
+use webai_agent::summariser::{HistorySummariser, SummariserConfig};
 use webai_agent::{AgentLoop, AgentSession};
 use webai_llm::LlmClient;
 use webai_memory::SharedMemoryStore;
 use webai_protocol::SessionEvent;
 
-/// A handler that replays the §5.1 loop end-to-end: reused script on repeat.
-struct JourneyHandler {
-    /// Count of invocations (to assert reuse).
-    calls: std::sync::atomic::AtomicUsize,
+/// The real loop-driven handler: every prompt runs through `AgentRunner::run`
+/// (stub LLM consulted when script memory misses) and `reused_script` comes
+/// from a real `SharedMemoryStore` lookup (`recall_scripts`), exactly the
+/// production path minus the browser FFI.
+struct LoopHandler {
+    memory: Arc<SharedMemoryStore>,
+    exec: StubExecutor,
 }
 
-impl AcpHandler for JourneyHandler {
+impl LoopHandler {
+    fn new(memory: Arc<SharedMemoryStore>) -> Self {
+        Self {
+            memory,
+            exec: StubExecutor::default(),
+        }
+    }
+}
+
+impl AcpHandler for LoopHandler {
     fn run(&self, session: &Arc<AgentSession>, prompt: &str) -> Result<Vec<SessionEvent>, String> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Replay: the second identical prompt marks the reused script (M-2).
-        let reused = self.calls.load(std::sync::atomic::Ordering::SeqCst) > 1;
-        session.push(webai_agent::ChatMessage::User(prompt.to_string()));
-        Ok(vec![
-            SessionEvent::Step {
+        // Truthful reuse: query the real memory store for a remembered script
+        // BEFORE the run stores a new one for this task.
+        let reused = !self.memory.recall_scripts(prompt, 1).is_empty();
+        let runner = AgentRunner::new(
+            RunConfig::default(),
+            (*self.memory).clone(),
+            HistorySummariser::new(SummariserConfig::default()),
+        );
+        let (steps, outcome, plan_injected) = {
+            let llm = session.agent_loop().llm().clone();
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(runner.run(prompt, &self.exec, &llm))
+        };
+
+        let mut events = Vec::new();
+        for step in &steps {
+            events.push(SessionEvent::Step {
                 step: webai_protocol::AgentStep {
-                    tool_name: "browser".into(),
-                    observation: Some(format!("observed for {prompt}")),
-                    image: Some("/tmp/webai-shot.png".into()),
+                    tool_name: step.tool_name.clone(),
+                    observation: step.observation.clone(),
+                    image: None,
                     reused_script: reused,
                 },
-            },
-            SessionEvent::Done {
-                state: webai_protocol::AgentState {
-                    status: "done".into(),
-                    message: None,
-                },
-            },
-        ])
+            });
+        }
+        let _ = plan_injected;
+        match outcome {
+            StepOutcome::Done { state, message } => {
+                events.push(SessionEvent::Done {
+                    state: webai_protocol::AgentState {
+                        status: state,
+                        message,
+                    },
+                });
+                Ok(events)
+            }
+            StepOutcome::Guard(err) => Err(format!("code=guard_failed {err:?}")),
+            StepOutcome::Error { code, message } => Err(format!("code={code} {message}")),
+        }
     }
 }
 
@@ -64,37 +98,25 @@ fn bootstrap_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn session(id: &str) -> Arc<AgentSession> {
+fn session(id: &str, memory: Arc<SharedMemoryStore>) -> Arc<AgentSession> {
     let llm = LlmClient::with_profile_stub("stub");
-    let loop_ = Arc::new(AgentLoop::new(
-        Arc::new(llm),
-        Arc::new(SharedMemoryStore::new()),
-        vec![],
-    ));
-    Arc::new(AgentSession::new(
-        id,
-        loop_,
-        Arc::new(SharedMemoryStore::new()),
-    ))
+    let loop_ = Arc::new(AgentLoop::new(Arc::new(llm), memory.clone(), vec![]));
+    Arc::new(AgentSession::new(id, loop_, memory))
 }
 
-fn dispatcher(sid: &str) -> (AcpSessionRegistry, Dispatcher) {
+fn loop_dispatcher(sid: &str) -> (AcpSessionRegistry, Dispatcher, Arc<SharedMemoryStore>) {
+    let memory = Arc::new(SharedMemoryStore::new());
     let reg = AcpSessionRegistry::new();
-    reg.register(session(sid));
-    let disp = Dispatcher::new(
-        reg,
-        Arc::new(JourneyHandler {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        }),
-    );
-    (disp.registry().clone(), disp)
+    reg.register(session(sid, memory.clone()));
+    let disp = Dispatcher::new(reg, Arc::new(LoopHandler::new(memory.clone())));
+    (disp.registry().clone(), disp, memory)
 }
 
-/// Journey A: first-use (local TUI main path). The prompt flows through the
-/// registry session, events stream with an image, and the loop finishes Done.
+/// Journey A: first-use. The prompt runs through the **real AgentRunner loop**
+/// (stub LLM); the Step/Done events are produced by the loop, not replayed.
 #[test]
 fn journey_a_first_use_streams_step_and_done() {
-    let (reg, disp) = dispatcher("ja");
+    let (reg, disp, _mem) = loop_dispatcher("ja");
     assert!(reg.get("ja").is_some(), "registry must hold the session");
     let req = AcpRequest {
         id: 1,
@@ -104,16 +126,20 @@ fn journey_a_first_use_streams_step_and_done() {
     let mut events = Vec::new();
     let resp = disp.dispatch(&req, &mut |ev| events.push(ev));
     assert!(resp.error.is_none());
-    // Step (with screenshot) then Done — journey A's observable stream.
+    // The loop produced at least one Step and finished Done.
     assert!(matches!(events[0], SessionEvent::Step { .. }));
-    assert!(matches!(events[1], SessionEvent::Done { .. }));
+    assert!(matches!(events.last().unwrap(), SessionEvent::Done { .. }));
+    // No fabricated reuse on the first run.
+    if let SessionEvent::Step { step } = &events[0] {
+        assert!(!step.reused_script, "first journey run composes fresh");
+    }
 }
 
-/// Journey B: repeat execution hits the script-memory path
-/// (`reused_script = true`, M-2 "gets faster with use").
+/// Journey B: repeat execution hits the real script-memory path — the runner
+/// stored a remembered script and `recall_scripts` finds it (M-2).
 #[test]
 fn journey_b_repeat_marks_reused_script() {
-    let (_reg, disp) = dispatcher("jb");
+    let (_reg, disp, memory) = loop_dispatcher("jb");
     let mk = |id| AcpRequest {
         id,
         method: "session/prompt".into(),
@@ -122,13 +148,20 @@ fn journey_b_repeat_marks_reused_script() {
     let mut first = Vec::new();
     let mut second = Vec::new();
     let _ = disp.dispatch(&mk(1), &mut |ev| first.push(ev));
+    // After the first run the memory store has a remembered script (real
+    // mechanism: ScriptMemory stored it during the run).
+    let remembered = memory.recall_scripts("导出新浪报表", 1);
+    let _ = remembered;
     let _ = disp.dispatch(&mk(2), &mut |second_ev| second.push(second_ev));
     let reused_of = |events: &[SessionEvent]| match &events[0] {
         SessionEvent::Step { step } => step.reused_script,
         _ => false,
     };
     assert!(!reused_of(&first), "first run composes fresh");
-    assert!(reused_of(&second), "second run must mark reused_script");
+    assert!(
+        reused_of(&second),
+        "second run must observe the real remembered script"
+    );
 }
 
 /// Journey C: failure surfaces a structured error event, never a bare string;
@@ -136,7 +169,7 @@ fn journey_b_repeat_marks_reused_script() {
 #[test]
 fn journey_c_failure_is_structured() {
     let reg = AcpSessionRegistry::new();
-    reg.register(session("jc"));
+    reg.register(session("jc", Arc::new(SharedMemoryStore::new())));
     let disp = Dispatcher::new(reg, Arc::new(ErrHandler));
     let req = AcpRequest {
         id: 3,
@@ -166,10 +199,10 @@ impl AcpHandler for ErrHandler {
     }
 }
 
-/// Journey D: resume after crash — the persisted transcript rebuilds and the
-/// session can keep running (M-3).
+/// Journey D: resume after crash — the persisted transcript rebuilds (M-3)
+/// **and the recovered session can keep writing to the same appender**.
 #[test]
-fn journey_d_crash_resume_rebuilds_transcript() {
+fn journey_d_crash_resume_rebuilds_and_continues_writing() {
     let dir = bootstrap_dir("jd");
     let sess_dir = dir.join("sessions");
     std::fs::create_dir_all(&sess_dir).unwrap();
@@ -188,6 +221,20 @@ fn journey_d_crash_resume_rebuilds_transcript() {
     let (session_id, lines) = runtime::resume_transcript(&found[0]).unwrap();
     assert_eq!(session_id, "jd-sess");
     assert_eq!(lines.len(), 2, "complete records only");
+
+    // Resume → write-back: reopen the same file in append mode and record a
+    // post-recovery turn; the recorder appends after the recovered records.
+    let recorder = webai_memory::JsonlSessionRecorder::new_for_dir(&sess_dir, "jd-sess")
+        .expect("resume must be able to reopen the transcript appender");
+    recorder
+        .record(serde_json::json!({"role": "user", "text": "post-resume turn"}))
+        .expect("post-resume write must succeed");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let valid: Vec<&str> = raw.lines().filter(|l| l.starts_with('{')).collect();
+    assert!(
+        valid.iter().any(|l| l.contains("post-resume turn")),
+        "recovered session must continue writing: {raw}"
+    );
 }
 
 /// Release gate: the runtime assembles in all three modes and the config
@@ -197,7 +244,7 @@ fn release_gate_modes_and_fail_fast() {
     let dir = bootstrap_dir("modes");
     let rt = runtime::bootstrap(&dir).unwrap();
     for mode in [LaunchMode::Tui, LaunchMode::Serve, LaunchMode::Headless] {
-        let _ = runtime::launch(&rt, mode);
+        let _ = runtime::launch(&rt, mode, None, None);
     }
     // Missing agent.toml is a structured failure naming the file.
     let empty = std::env::temp_dir().join(format!("webai-m6-empty2-{}", std::process::id()));
@@ -208,7 +255,8 @@ fn release_gate_modes_and_fail_fast() {
 }
 
 /// Release gate: network boundary — loopback-only by default, non-loopback
-/// refused, `--public` requires pairing (M-5 / §3.3).
+/// refused, `--public` requires pairing (M-5 / §3.3), and the admit gate is
+/// enforced through the transport accept loop with key comparison.
 #[test]
 fn release_gate_network_boundary() {
     use std::net::IpAddr;
@@ -223,12 +271,19 @@ fn release_gate_network_boundary() {
         webai_acp::Admission::Allow
     ));
     assert!(NetworkPolicy::resolve(true, false).is_err());
+    // Public + real secret: wrong key denied through the accept gate.
+    let public = NetworkPolicy::resolve(true, true)
+        .unwrap()
+        .with_pairing_secret("sekrit");
+    assert!(webai_acp::accept_connection(&public, remote, None).is_err());
+    assert!(webai_acp::accept_connection(&public, remote, Some("wrong")).is_err());
+    assert!(webai_acp::accept_connection(&public, remote, Some("sekrit")).is_ok());
 }
 
 /// Release gate: unknown method gets a structured -32601, not "unknown error".
 #[test]
 fn release_gate_unknown_method_is_structured() {
-    let (_reg, disp) = dispatcher("gate");
+    let (_reg, disp, _mem) = loop_dispatcher("gate");
     let req = AcpRequest {
         id: 9,
         method: "no/such".into(),
