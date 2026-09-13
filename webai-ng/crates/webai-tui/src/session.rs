@@ -23,6 +23,15 @@ use crate::UiCommand;
 /// Bounded event channel capacity (backpressure: no unbounded growth).
 pub const EVENT_CHANNEL_CAPACITY: usize = 32;
 
+/// spawn outside a Tokio runtime context (structured, actionable startup
+/// error; replaces `tokio::spawn`'s raw panic).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "SessionBackend::spawn called outside a Tokio runtime context; \
+         build the session backend inside the TUI runtime (see bins/webai tui hook)"
+)]
+pub struct RuntimeErrorNoReactor;
+
 /// How many outstanding `Step` events may coalesce into one progress event when
 /// the frontend is slow (backpressure policy: bounded channel + coalescing).
 pub const COALESCE_STEP_BURST: usize = 8;
@@ -53,6 +62,21 @@ impl SessionBackend {
     ///
     /// `handler` drives the agent loop for each prompt. `session` is shared so
     /// the frontend can read the transcript without touching bridge layers.
+    ///
+    /// Must be called from inside a Tokio runtime context. Violations produce
+    /// a structured, actionable error instead of `tokio::spawn`'s panic.
+    pub fn try_spawn(
+        session: Arc<AgentSession>,
+        handler: Arc<dyn PromptHandler>,
+    ) -> Result<Self, RuntimeErrorNoReactor> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Err(RuntimeErrorNoReactor);
+        }
+        Ok(Self::spawn(session, handler))
+    }
+
+    /// Spawn the background session task (panics outside a runtime context,
+    /// same contract as `tokio::spawn`). Prefer [`Self::try_spawn`].
     pub fn spawn(session: Arc<AgentSession>, handler: Arc<dyn PromptHandler>) -> Self {
         let (events_tx, events_rx) = mpsc::channel::<SessionEvent>(EVENT_CHANNEL_CAPACITY);
         let (commands_tx, commands_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -280,6 +304,18 @@ mod tests {
     use webai_agent::AgentLoop;
     use webai_llm::LlmClient;
     use webai_memory::SharedMemoryStore;
+
+    /// Regression (cold-start panic): `try_spawn` outside a runtime returns
+    /// a structured error instead of panicking via `tokio::spawn`.
+    #[test]
+    fn try_spawn_outside_runtime_is_structured_error() {
+        let err = SessionBackend::try_spawn(
+            build_session("noreactor"),
+            Arc::new(FakeHandler { fail: false }),
+        )
+        .unwrap_err();
+        assert_eq!(err, RuntimeErrorNoReactor);
+    }
 
     fn build_session(id: &str) -> Arc<AgentSession> {
         let llm = LlmClient::with_profile_stub("stub");

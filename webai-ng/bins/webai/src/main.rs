@@ -186,8 +186,11 @@ fn run(
                         ),
                     )),
                 );
-                let mut backend =
-                    webai_tui::session::SessionBackend::spawn(std::sync::Arc::new(session), handler);
+                let mut backend = webai_tui::session::SessionBackend::try_spawn(
+                    std::sync::Arc::new(session),
+                    handler,
+                )
+                .map_err(|e| RuntimeError::Io(e.to_string()))?;
 
                 // Relay SessionEvents -> UiEvents for the run loop, and forward
                 // run-loop commands -> backend (send_prompt / shutdown).
