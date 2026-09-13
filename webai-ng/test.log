@@ -1,0 +1,52 @@
+   Compiling webai-bridge v0.1.0 (/home/xiao/workspace/agent/arch/webai-ng/crates/webai-bridge)
+error[E0603]: struct `CannedBackend` is private
+   --> crates/webai-bridge/src/lib.rs:271:49
+    |
+271 |         WebkitBridge::with_canned(webai_webkit::CannedBackend {
+    |                                                 ^^^^^^^^^^^^^ private struct
+    |
+note: the struct `CannedBackend` is defined here
+   --> crates/webai-webkit/src/lib.rs:188:1
+    |
+188 | pub(crate) struct CannedBackend {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: struct `CannedBackend` is private
+   --> crates/webai-bridge/src/lib.rs:383:49
+    |
+383 |         WebkitBridge::with_canned(webai_webkit::CannedBackend {
+    |                                                 ^^^^^^^^^^^^^ private struct
+    |
+note: the struct `CannedBackend` is defined here
+   --> crates/webai-webkit/src/lib.rs:188:1
+    |
+188 | pub(crate) struct CannedBackend {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no associated function or constant named `with_canned` found for struct `webai_webkit::WebkitBridge` in the current scope
+   --> crates/webai-bridge/src/lib.rs:271:23
+    |
+271 |         WebkitBridge::with_canned(webai_webkit::CannedBackend {
+    |                       ^^^^^^^^^^^ associated function or constant not found in `webai_webkit::WebkitBridge`
+    |
+note: if you're trying to build a new `webai_webkit::WebkitBridge`, consider using `webai_webkit::WebkitBridge::new` which returns `webai_webkit::WebkitBridge`
+   --> crates/webai-webkit/src/lib.rs:199:5
+    |
+199 |     pub fn new() -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no associated function or constant named `with_canned` found for struct `webai_webkit::WebkitBridge` in the current scope
+   --> crates/webai-bridge/src/lib.rs:383:23
+    |
+383 |         WebkitBridge::with_canned(webai_webkit::CannedBackend {
+    |                       ^^^^^^^^^^^ associated function or constant not found in `webai_webkit::WebkitBridge`
+    |
+note: if you're trying to build a new `webai_webkit::WebkitBridge`, consider using `webai_webkit::WebkitBridge::new` which returns `webai_webkit::WebkitBridge`
+   --> crates/webai-webkit/src/lib.rs:199:5
+    |
+199 |     pub fn new() -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^
+
+Some errors have detailed explanations: E0599, E0603.
+For more information about an error, try `rustc --explain E0599`.
+error: could not compile `webai-bridge` (lib test) due to 4 previous errors

@@ -173,7 +173,13 @@ impl WebkitBridge {
         self.backend.lock().unwrap().is_some()
     }
 
-    /// Navigate the view to `url` and wait for load.
+    /// Navigate the view to `url` and wait for its load.
+    ///
+    /// A freshly launched view fires `LOAD_FINISHED` for `about:blank` shortly
+    /// after startup; that event must not satisfy a navigation wait (seen on
+    /// real WPE: `open()` resolved while `location.href` was still
+    /// `about:blank`). Loop until the finished event's URI matches the target
+    /// (or a redirect of it), or the overall timeout expires.
     pub async fn open(&self, url: &str) -> Result<LoadSnapshot, WebkitError> {
         // Canned path (tests).
         if let Some(canned) = self.canned.lock().unwrap().as_ref() {
@@ -181,6 +187,7 @@ impl WebkitBridge {
                 return Ok(ev.clone());
             }
         }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(15_000);
         {
             let backend = self.backend.lock().unwrap();
             let backend = backend.as_ref().ok_or_else(|| {
@@ -190,15 +197,49 @@ impl WebkitBridge {
             })?;
             backend.load_uri(url)?;
         } // drop the lock before awaiting
-          // Wait for the load to finish (oneshot).
-        self.wait_for_load(15_000).await
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(WebkitError::Timeout(15_000));
+            }
+            let snapshot = self.wait_for_load(remaining.as_millis() as u64).await?;
+            // On real WebKit, `load-changed` reports the (possibly provisional)
+            // requested URI at event time, so an `about:blank` startup finish
+            // can arrive already carrying the target URI. Confirm the page
+            // actually committed by reading `location.href` before returning.
+            if let Ok(href) = self
+                .evaluate_javascript("return window.location.href", 5_000, None)
+                .await
+            {
+                let href = href.json.as_str().unwrap_or_default().to_owned();
+                if href == url || href.split("://").nth(1).unwrap_or("").split('/').next()
+                    == url.split("://").nth(1).unwrap_or("").split('/').next()
+                {
+                    return Ok(snapshot);
+                }
+                // Page still on a different document: keep waiting for the
+                // load event of the target.
+                continue;
+            }
+            // Evaluate unavailable: fall back to the event URI match.
+            if snapshot.url == url {
+                return Ok(snapshot);
+            }
+        }
     }
 
     /// Evaluate a JavaScript snippet, injecting `window.__webkit_args__`.
+    ///
+    /// `args_json` is the serialized `ScriptModule.args` object. It is set as
+    /// `window.__webkit_args__` in the same evaluate call (prologue before the
+    /// module), so composed drivers read exactly the request's args (BUG-3 /
+    /// Kaneo #101). Passing `null` still assigns `null` so a previous
+    /// injection cannot leak into the next call.
     pub async fn evaluate_javascript(
         &self,
         src: &str,
         timeout_ms: u64,
+        args_json: Option<&str>,
     ) -> Result<EvaluateResult, WebkitError> {
         // Canned path (tests).
         if let Some(canned) = self.canned.lock().unwrap().as_ref() {
@@ -215,7 +256,19 @@ impl WebkitBridge {
                 "no FFI environment; cannot evaluate_javascript in stub mode".into(),
             )
         })?;
-        let payload = backend.evaluate(src, timeout_ms as u32)?;
+        // Prologue: bind `window.__webkit_args__` for this call only. The args
+        // JSON is produced by `webai-script::args_injection` (valid JSON); a
+        // JSON.stringify round-trip in the page guards against any quoting
+        // subtleties and keeps the value re-serializable.
+        let full_src = match args_json {
+            Some(args) => format!(
+                "window.__webkit_args__ = JSON.parse({});\n",
+                serde_json::to_string(args)
+                    .map_err(|e| WebkitError::ScriptError(format!("args not serializable: {e}")))?
+            ) + src,
+            None => "window.__webkit_args__ = null;\n".to_owned() + src,
+        };
+        let payload = backend.evaluate(&full_src, timeout_ms as u32)?;
         // The C++ side returns `{"ok":true,"value":<json>}` or
         // `{"ok":false,"error":"..."}`.
         let parsed: serde_json::Value = serde_json::from_str(&payload)
@@ -405,7 +458,7 @@ mod tests {
             other => panic!("expected CogLaunch, got {other:?}"),
         }
         assert!(matches!(
-            bridge.evaluate_javascript("1+1", 100).await,
+            bridge.evaluate_javascript("1+1", 100, None).await,
             Err(WebkitError::CogLaunch(_))
         ));
         assert!(matches!(
@@ -424,7 +477,7 @@ mod tests {
             evaluate_result: Some(serde_json::json!(2)),
             ..Default::default()
         });
-        let res = bridge.evaluate_javascript("1+1", 1000).await.unwrap();
+        let res = bridge.evaluate_javascript("1+1", 1000, None).await.unwrap();
         assert_eq!(res.json, serde_json::json!(2));
     }
 

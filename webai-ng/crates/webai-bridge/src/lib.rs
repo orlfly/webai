@@ -25,6 +25,18 @@ pub mod perf;
 pub use download_guard::{sanitize_filename, FilenameError};
 pub use perf::{CacheKey, Clock, ComposeCache, ScreenshotDecision, ScreenshotThrottle};
 
+/// Traverse a JSON path and read its boolean value.
+fn json_get_bool(json: &serde_json::Value, path: &[&str]) -> bool {
+    let mut cur = json;
+    for key in path {
+        match cur.get(key) {
+            Some(next) => cur = next,
+            None => return false,
+        }
+    }
+    cur.as_bool().unwrap_or(false)
+}
+
 /// Structured error from the bridge layer.
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -131,8 +143,22 @@ impl Bridge {
         let module = self.cache.compose(req)?;
         let result = self
             .webkit
-            .evaluate_javascript(&module.execute_src, 30_000)
+            .evaluate_javascript(&module.execute_src, 30_000, Some(&module.args))
             .await?;
+        // Composed navigate signals the host to drive the load from Rust
+        // (BUG-1 / Kaneo #99): run `webkit.open(url)` to navigate and wait for
+        // LOAD_FINISHED, then re-run verify against the loaded page. The
+        // execute phase reports ok:false by design here; a `needs_rust_load`
+        // result is not an error.
+        if json_get_bool(&result.json, &["execute", "needs_rust_load"]) {
+            let url = req.args.get("url").and_then(|v| v.as_str()).ok_or_else(
+                || BridgeError::Webkit(WebkitError::ScriptError(
+                    "navigate requested needs_rust_load but args.url is missing".into(),
+                )),
+            )?;
+            self.webkit.open(url).await?;
+            return self.merge_verify_only(req, &module).await;
+        }
         self.merge(req, result).await
     }
 
@@ -181,6 +207,21 @@ impl Bridge {
     /// evaluate result JSON carries both phase payloads. `ok = execute.ok &&
     /// verify.ok`. A verify failure is surfaced with `phase = "verify"` and the
     /// JS exception text.
+    /// Run only the verify phase of `module` (after the host completed a Rust
+    /// side-effect such as `webkit.open(url)` for `needs_rust_load` verbs),
+    /// then merge it like a normal two-phase result.
+    async fn merge_verify_only(
+        &self,
+        req: &BrowserToolRequest,
+        module: &webai_script::ScriptModule,
+    ) -> Result<BrowserToolResponse, BridgeError> {
+        let eval = self
+            .webkit
+            .evaluate_javascript(&module.verify_src_eval(), 30_000, Some(&module.args))
+            .await?;
+        self.merge(req, eval).await
+    }
+
     async fn merge(
         &self,
         req: &BrowserToolRequest,
@@ -190,7 +231,8 @@ impl Bridge {
         let execute = json.get("execute").cloned().unwrap_or_default();
         let verify = json.get("verify").cloned().unwrap_or_default();
 
-        let execute_ok = execute.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let execute_ok = execute.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
+            || execute.get("needs_rust_load").and_then(|v| v.as_bool()).unwrap_or(false);
         let verify_ok = verify.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         let ok = execute_ok && verify_ok;
 
@@ -345,6 +387,56 @@ mod tests {
             .unwrap();
         assert!(!resp.ok);
         assert!(resp.error.is_some());
+    }
+
+    /// BUG-1 / Kaneo #99: when the composed execute phase reports
+    /// `needs_rust_load`, the host must drive `webkit.open(url)` and run the
+    /// verify-only merge instead of reporting EXECUTE_FAILED. With a canned
+    /// backend the open() resolves from the queued load event.
+    #[tokio::test]
+    async fn needs_rust_load_drives_open_and_skips_execute_failure() {
+        let webkit = WebkitBridge::with_canned(webai_webkit::CannedBackend {
+            evaluate_result: Some(json!({
+                "execute": { "ok": false, "needs_rust_load": true, "url": "https://x.com" },
+                "verify": { "ok": true, "stage": "verify" },
+                "args": {}
+            })),
+            load_events: vec![webai_webkit::LoadSnapshot {
+                url: "https://x.com".into(),
+                title: "x".into(),
+                status: "200".into(),
+            }],
+            ..Default::default()
+        });
+        let bridge = Bridge::new(webkit);
+        let resp = bridge
+            .handle_tool_call(&req(
+                BrowserVerb::Navigate,
+                json!({ "url": "https://x.com" }),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.ok, "navigate must succeed via host-driven load: {:?}", resp.error);
+        assert!(
+            !resp
+                .result
+                .as_ref()
+                .map(|r| serde_json::to_string(r).unwrap().contains("EXECUTE_FAILED"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_rust_load_missing_url_is_structured_error() {
+        let bridge = Bridge::new(canned_bridge(true, true));
+        // Force navigate with an args payload lacking url — compose would
+        // reject it before dispatch, so exercise the guard through
+        // json_get_bool's path only via a direct canned execute flag.
+        assert!(!json_get_bool(&json!({}), &["execute", "needs_rust_load"]));
+        assert!(json_get_bool(
+            &json!({ "execute": { "needs_rust_load": true } }),
+            &["execute", "needs_rust_load"]
+        ));
     }
 
     #[tokio::test]

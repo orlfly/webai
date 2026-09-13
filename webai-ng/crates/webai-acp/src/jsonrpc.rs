@@ -148,6 +148,23 @@ impl AcpSessionRegistry {
         removed
     }
 
+    /// Remove a session while holding its per-session worker lock first.
+    ///
+    /// Used by `session/close` (Kaneo #102): a concurrent `session/prompt`
+    /// for the same session blocks on the worker lock until the removal
+    /// completes, so a prompt run cannot straddle the close.
+    pub fn remove_locked(&self, session_id: &str) -> Option<Arc<AgentSession>> {
+        // Hold the worker guard across the whole removal: clone the handle
+        // (a cheap Arc) at this function's scope and lock it there, so the
+        // guard stays alive until the removal completes.
+        let handle = self.workers.lock().unwrap().get(session_id).cloned();
+        let guard_holder = handle.as_ref().map(|h| h.lock());
+        let removed = self.sessions.lock().unwrap().remove(session_id);
+        self.workers.lock().unwrap().remove(session_id);
+        drop(guard_holder);
+        removed
+    }
+
     /// Serialize `session/prompt` and `session/close` per session. A per-session
     /// worker serializes concurrent prompt/close calls for the same session so
     /// there is no data race on its transcript (ARCHITECTURE.md §4.10).
@@ -290,12 +307,26 @@ impl Dispatcher {
     }
 
     /// `session/close`: remove the session from the registry.
+    ///
+    /// Holds the per-session worker lock while removing so a concurrent
+    /// `session/prompt` on the same session either completes before the
+    /// removal or observes an unregistered session afterwards — no prompt run
+    /// may straddle the close and keep emitting events on a removed session
+    /// (Kaneo #102).
     fn session_close(&self, req: &AcpRequest) -> AcpResponse {
         match self.session_id_from_params(req) {
-            Some(id) if self.registry.remove(&id).is_some() => {
-                self.ok(req, serde_json::json!({ "closed": id }))
+            Some(id) => {
+                // Grab the worker lock BEFORE removing the registration.
+                // resolve-scope guard: if the session never existed the lock
+                // is absent and removal fails structurally.
+                let had = self.registry.remove_locked(&id);
+                if had.is_some() {
+                    self.ok(req, serde_json::json!({ "closed": id }))
+                } else {
+                    self.err(req.id, code::app("session not found"))
+                }
             }
-            _ => self.err(req.id, code::app("session not found")),
+            None => self.err(req.id, code::app("session not found")),
         }
     }
 
@@ -369,6 +400,7 @@ mod worker {
                 m: Arc::new(PLMutex::new(())),
             }
         }
+        /// Lock. Borrow must live inside the caller's scope alongside the handle.
         pub fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
             self.m.lock()
         }
@@ -528,6 +560,81 @@ mod tests {
         // The session transcript may be empty (handler didn't write) but the
         // registry must still be consistent (no panic / corruption).
         assert!(s.session_id() == "s1");
+    }
+
+    /// Kaneo #102: a close issued while a prompt is mid-run must hold the
+    /// session's worker lock, so the run either completes before removal or
+    /// is refused afterwards — events never continue on a removed session.
+    #[test]
+    fn close_during_long_prompt_blocks_until_prompt_done() {
+        struct SlowThenEvents;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc as StdArc;
+        static PROMPT_RUNNING: AtomicBool = AtomicBool::new(false);
+        impl AcpHandler for SlowThenEvents {
+            fn run(
+                &self,
+                session: &StdArc<AgentSession>,
+                _prompt: &str,
+            ) -> Result<Vec<SessionEvent>, String> {
+                PROMPT_RUNNING.store(true, Ordering::SeqCst);
+                // Hold long enough for main thread to attempt a close.
+                for _ in 0..50 {
+                    if !PROMPT_RUNNING.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                PROMPT_RUNNING.store(false, Ordering::SeqCst);
+                let _ = session;
+                Ok(vec![SessionEvent::Done {
+                    state: webai_protocol::AgentState {
+                        status: "done".into(),
+                        message: None,
+                    },
+                }])
+            }
+        }
+        let (reg, _) = registry();
+        let disp = Dispatcher::new(reg, Arc::new(SlowThenEvents));
+        let d_thread = disp.clone();
+        let prompt_thread = std::thread::spawn(move || {
+            let req = request(
+                "session/prompt",
+                serde_json::json!({"session_id": "s1", "prompt": "go"}),
+            );
+            let mut events = Vec::new();
+            let resp = d_thread.dispatch(&req, &mut |ev| events.push(ev));
+            (resp, events)
+        });
+        // Wait until the prompt actually holds the worker lock.
+        while !PROMPT_RUNNING.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Close from another thread: must block until prompt completes.
+        let close_thread = {
+            let d = disp.clone();
+            std::thread::spawn(move || {
+                let req =
+                    request("session/close", serde_json::json!({"session_id": "s1"}));
+                d.dispatch(&req, &mut |_| {})
+            })
+        };
+        let (resp, events) = prompt_thread.join().unwrap();
+        // Prompt's own events completed fully before/while close waited.
+        assert!(resp.error.is_none(), "prompt completes normally");
+        assert_eq!(events.len(), 1, "Done event emitted by prompt's own run");
+        let close_resp = close_thread.join().unwrap();
+        assert!(close_resp.error.is_none(), "close then removes the session");
+        // Post-close prompt on the removed session is refused.
+        let late = disp.dispatch(
+            &request(
+                "session/prompt",
+                serde_json::json!({"session_id": "s1", "prompt": "x"}),
+            ),
+            &mut |_| {},
+        );
+        assert!(late.error.is_some(), "late prompt must be refused");
     }
 
     #[test]

@@ -1,9 +1,17 @@
 //! Real-device (WPE) end-to-end verification of the full 13-verb pipeline:
 //! webai-bridge::Bridge::handle_tool_call -> compose -> WebkitBridge (FFI) -> WPE.
-//! Evidence for Kaneo tasks #34 / #46 (navigate/evaluate/get_text on real WPE).
+//! Evidence for Kaneo tasks #34 / #46, and for the bug fixes #99 (needs_rust_load
+//! host-driven load), #100 (load callback thread mismatch), #101
+//! (window.__webkit_args__ injection).
+//!
+//! Post-fix contract exercised here (no manual workarounds):
+//! * navigate via dispatch -> host detects `needs_rust_load` -> `webkit.open(url)`
+//!   resolves on a real LOAD_FINISHED (proves #99 + #100 together).
+//! * click / evaluate via dispatch read args from the host-injected
+//!   `window.__webkit_args__` (proves #101; no per-call manual injection).
 //!
 //! Run inside a WPE environment (headless weston + WAYLAND_DISPLAY set):
-//!   cargo test -p webai-bridge --features webai-bridge-cxx/legacy_cpp \
+//!   WAYLAND_DISPLAY=webai-wl cargo test -p webai-bridge --features real_backend \
 //!     --test real_device_e2e -- --ignored --nocapture
 #![cfg(feature = "real_backend")]
 
@@ -17,6 +25,32 @@ fn req(verb: BrowserVerb, args: serde_json::Value) -> BrowserToolRequest {
     BrowserToolRequest { verb, args }
 }
 
+/// Serve one HTML page on an ephemeral 127.0.0.1 port. Top-frame data: URLs are
+/// blocked by WebKit, so real HTTP is required.
+fn spawn_httpPage(html: impl Into<String>) -> String {
+    let html = html.into();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        // WebKit issues more than one connection (page + favicon); keep
+        // serving so a favicon probe can't stall the main document load.
+        use std::io::Write;
+        for _ in 0..3 {
+            let (mut stream, _) = match listener.accept() {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let body = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                html.len(),
+                html
+            );
+            stream.write_all(body.as_bytes()).unwrap();
+        }
+    });
+    format!("http://127.0.0.1:{port}/")
+}
+
 #[tokio::test]
 #[ignore = "real-device e2e: requires legacy_cpp + cog/WPE + wayland"]
 async fn real_device_full_pipeline() {
@@ -27,102 +61,43 @@ async fn real_device_full_pipeline() {
     );
     let bridge = Bridge::new(webkit);
 
-    // 1. navigate: NOTE the bridge dispatch path returns
-    //    needs_rust_load from the composed navigate script but merge() never
-    //    consumes it (real bug, see review). Drive the load via the webkit
-    //    bridge directly to prove real navigation works, and record the
-    //    dispatch-path failure separately.
-    let nav_dispatch = bridge
-        .handle_tool_call(&req(
-            BrowserVerb::Navigate,
-            json!({"url": "data:text/html,<title>e2e-page</title><body><h1 id=h>real-wpe</h1><button id=b>go</button></body>"}),
-        ))
+    let html = "<html><head><title>e2e-page</title></head><body><h1 id=h>real-wpe</h1><button id=b>go</button></body></html>";
+    let url = spawn_httpPage(html);
+
+    // 1. navigate via the full dispatch path (BUG-1 fix: host detects
+    //    needs_rust_load, calls open(), waits for the REAL load event — this
+    //    also proves BUG-2's fix because open() resolves via the trampoline
+    //    callback, not a timeout).
+    let nav = bridge
+        .handle_tool_call(&req(BrowserVerb::Navigate, json!({"url": url})))
         .await
         .expect("navigate dispatch must not error");
-    println!(
-        "REAL-E2E navigate dispatch ok={} (needs_rust_load unhandled: {})",
-        nav_dispatch.ok, !nav_dispatch.ok
-    );
-    // BUG-2 note: webkit().open() times out on the real device (load_trampoline
-    // thread_local never sees the callback: registered on the main thread but
-    // invoked from the loop thread). Navigate via location.href and poll.
-    // NOTE: top-frame data: URLs are blocked by WebKit, so serve real HTTP.
-    let html = "<html><head><title>e2e-page</title></head><body><h1 id=h>real-wpe</h1><button id=b>go</button></body></html>";
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let body = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            html.len(),
-            html
-        );
-        use std::io::Write;
-        let mut s = stream;
-        s.write_all(body.as_bytes()).unwrap();
-    });
-    let url = format!("http://127.0.0.1:{port}/");
-    bridge
-        .webkit()
-        .evaluate_javascript(&format!("window.location.href = {url:?}; \"navigating\""), 5000)
-        .await
-        .expect("location.href navigation must succeed");
-    let mut ready = false;
-    for _ in 0..50 {
-        if let Ok(ev) = bridge
-            .webkit()
-            .evaluate_javascript("return document.readyState", 2000)
-            .await
-        {
-            if ev.json.to_string().contains("complete") {
-                ready = true;
-                break;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(ready, "page must reach readyState=complete on real WPE");
-
-    // 2. poll for the real page title via evaluate (navigation is async)
-    // BUG-3 note: evaluate_javascript never injects window.__webkit_args__ on
-    // the real backend (doc comment claims it does), so composed scripts read
-    // empty args. Pre-set the args window manually to compensate.
-    bridge
-        .webkit()
-        .evaluate_javascript(
-            "window.__webkit_args__ = { script: \"document.title\" }; 1",
-            5000,
-        )
-        .await
-        .expect("args injection must succeed");
-    let mut title = serde_json::Value::Null;
-    for _ in 0..50 {
-        let r = bridge
-            .handle_tool_call(&req(
-                BrowserVerb::Evaluate,
-                json!({"script": "document.title"}),
-            ))
-            .await
-            .expect("evaluate must succeed");
-        assert!(r.ok, "evaluate ok");
-        if let Some(t) = r
-            .result
-            .as_ref()
-            .and_then(|v| v.get("execute"))
-            .and_then(|e| e.get("result"))
-        {
-            if t.as_str().is_some() {
-                title = t.clone();
-                break;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    let ex = serde_json::json!({"result": title});
-    let title = ex.get("result").cloned().unwrap_or_default();
     assert!(
-        title.to_string().contains("e2e-page"),
-        "evaluate must return real page title, got {title}"
+        nav.ok,
+        "navigate dispatch must succeed end-to-end (BUG-1/#99 + BUG-2/#100), resp={nav:?}"
+    );
+
+    // 2. evaluate via dispatch (BUG-3 fix: args injected by the host, no
+    //    manual window.__webkit_args__ setup).
+    let r = bridge
+        .handle_tool_call(&req(
+            BrowserVerb::Evaluate,
+            json!({"script": "document.title"}),
+        ))
+        .await
+        .expect("evaluate must succeed");
+    assert!(r.ok, "evaluate ok, resp={r:?}");
+    let title = r
+        .result
+        .as_ref()
+        .and_then(|v| v.get("execute"))
+        .and_then(|e| e.get("result"))
+        .cloned()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        title.contains("e2e-page"),
+        "evaluate must return real page title via injected args, got {title}"
     );
 
     // 3. get_text: real DOM walk over the loaded page
@@ -156,20 +131,12 @@ async fn real_device_full_pipeline() {
         .to_string();
     assert!(snap.contains("e2e-page"), "snapshot must carry title, got {snap}");
 
-    // 5. click on the real button (per-call args injection, see BUG-3)
-    bridge
-        .webkit()
-        .evaluate_javascript(
-            "window.__webkit_args__ = { selector: \"#b\" }; 1",
-            5000,
-        )
-        .await
-        .expect("click args injection");
+    // 5. click via dispatch (injected-args path again)
     let r = bridge
         .handle_tool_call(&req(BrowserVerb::Click, json!({"selector": "#b"})))
         .await
         .expect("click must succeed");
-    assert!(r.ok, "click ok, resp={r:?}");
+    assert!(r.ok, "click ok via injected args (BUG-3/#101), resp={r:?}");
 
     // 6. screenshot: composed verb (page dimensions) + real PNG capture
     let r = bridge

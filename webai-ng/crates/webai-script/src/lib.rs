@@ -31,6 +31,34 @@ pub struct ScriptModule {
     pub args: String,
 }
 
+impl ScriptModule {
+    /// A self-contained, evaluable source that runs only the verify phase.
+    ///
+    /// Used when the host completed a verb's side effect in Rust (e.g.
+    /// `needs_rust_load` navigate): the execute phase is reported as skipped
+    /// and ok, so the two-phase merge only gates on verify.
+    pub fn verify_src_eval(&self) -> String {
+        // Extract the verify function name from the composed verify source so
+        // this works for any needs_rust_load verb (currently navigate only).
+        let fn_name = self
+            .verify_src
+            .split("function ")
+            .nth(1)
+            .and_then(|rest| rest.split('(').next())
+            .unwrap_or("verify_navigate")
+            .trim()
+            .to_owned();
+        format!(
+            "{}\nconst __a__ = window.__webkit_args__ || {{}};\nreturn (async () => ({{\n\
+             \x20 execute: {{ ok: true, stage: \"execute\", skipped: true }},\n\
+             \x20 verify: {fn_name}(__a__),\n\
+             \x20 args: __a__,\n\
+             }}))();",
+            self.verify_src
+        )
+    }
+}
+
 /// Errors from composing a script module.
 #[derive(Debug, thiserror::Error)]
 pub enum ScriptError {
@@ -454,6 +482,23 @@ mod tests {
             !m.execute_src.contains("https://x.com"),
             "url must not be inlined"
         );
+    }
+
+    #[test]
+    fn verify_src_eval_runs_full_verify_fn_with_injected_args() {
+        // verify_src is the full `function verify_*(args){...}` source; the
+        // verify-only driver must define it, read the host-injected args, and
+        // report the execute phase as skipped-ok (BUG-1 / Kaneo #99).
+        let m = compose(&req(
+            BrowserVerb::Navigate,
+            json!({ "url": "https://x.com" }),
+        ))
+        .unwrap();
+        let src = m.verify_src_eval();
+        assert!(src.contains("function verify_navigate(args)"));
+        assert!(src.contains("verify_navigate(__a__)"));
+        assert!(src.contains("\"skipped\": true") || src.contains("skipped: true"));
+        assert!(!src.contains("execute_navigate"), "execute must not run");
     }
 
     #[test]

@@ -98,7 +98,7 @@ impl WebkitBridgeCxx {
     {
         #[cfg(feature = "legacy_cpp")]
         {
-            LOAD_CALLBACK.with(|c| *c.borrow_mut() = Some(Box::new(cb)));
+            LOAD_CALLBACK.lock().unwrap().replace(Box::new(cb));
             if let Some(view) = self.view {
                 unsafe {
                     ffi::webkit_bridge_set_load_callback(view, load_trampoline);
@@ -296,12 +296,13 @@ pub mod ffi {
 }
 
 // Rust-side callback invoked by the C++ bridge on `WEBKIT_LOAD_FINISHED`.
-// Stored in a thread-local so the C++ trampoline can route to it.
+// Stored in a process-global: the C++ trampoline fires on the cog loop
+// thread, which is never the thread that registers the callback, so a
+// thread_local would read as `None` there and silently drop every load
+// event (BUG-2 / Kaneo #100).
 #[cfg(feature = "legacy_cpp")]
-thread_local! {
-    static LOAD_CALLBACK: std::cell::RefCell<Option<Box<dyn Fn(LoadFinished) + Send>>> =
-        std::cell::RefCell::new(None);
-}
+static LOAD_CALLBACK: std::sync::Mutex<Option<Box<dyn Fn(LoadFinished) + Send>>> =
+    std::sync::Mutex::new(None);
 
 /// Rust callback fired by the C++ side on `WEBKIT_LOAD_FINISHED`. cxx wraps
 /// this safe Rust `fn` into a `rust::Fn` on the C++ side.
@@ -324,11 +325,9 @@ fn load_trampoline(uri: *const c_char, title: *const c_char, status: i32) {
             .into_owned()
     };
     let event = LoadFinished { uri, title, status };
-    LOAD_CALLBACK.with(|c| {
-        if let Some(cb) = c.borrow().as_ref() {
-            cb(event);
-        }
-    });
+    if let Some(cb) = LOAD_CALLBACK.lock().unwrap().as_ref() {
+        cb(event);
+    }
 }
 
 #[cfg(test)]
