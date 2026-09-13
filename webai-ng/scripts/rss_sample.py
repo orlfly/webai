@@ -56,6 +56,7 @@ def tree_rss_kb(pid: int) -> int:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fixture", required=True, help="path to fixture html (served over loopback HTTP)")
+    ap.add_argument("--webai-config-dir", default=os.path.expanduser("~/.webai/config"))
     ap.add_argument("--webai-bin", default="./target/release/webai")
     ap.add_argument("--interval", type=float, default=5.0)
     ap.add_argument("--samples", type=int, default=12)
@@ -76,7 +77,7 @@ def main():
     env = dict(os.environ, WEBAI_LLM_DISABLED="1")
     resident_secs = int(max(args.samples * args.interval, 10))
     proc = subprocess.Popen(
-        [args.webai_bin, "--headless", "--prompt",
+        [args.webai_bin, "--headless", "--config-dir", args.webai_config_dir, "--prompt",
          f"navigate url=http://127.0.0.1:{STATIC_PORT}/{page_name}",
          "--resident-secs", str(resident_secs)],
         cwd=root, env=env,

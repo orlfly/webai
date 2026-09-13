@@ -19,3 +19,7 @@ webai-acp = { path = "../../crates/webai-acp" }
 webai-tui = { path = "../../crates/webai-tui" }
 webai-webkit = { path = "../../crates/webai-webkit" }
 tokio = { workspace = true }
+
+[features]
+# Real WPE backend (legacy_cpp chain). Default build stays pure Rust.
+real_backend = ["webai-webkit/real_ffi"]
