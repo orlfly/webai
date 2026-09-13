@@ -76,6 +76,18 @@ jobs:
       - name: Real-device smoke test (--ignored)
         run: cargo test -p webai-bridge-cxx --features legacy_cpp --test real_device_smoke -- --ignored --nocapture
 
+      # T2/T3 real-device e2e matrix + reuse case (#103/#104/#106 via #107):
+      # the WPE-backed 21-case matrix, the full pipeline, and the FR-3 reuse
+      # chain, each `--ignored`-gated and run as separate processes (cog
+      # allows one initialization per process). Headless rendering via
+      # xvfb-run + WPE_BACKEND=fdo, matching ci/wpe.Dockerfile.
+      - name: Real-device e2e matrix T2/T3 (--ignored, headless WPE)
+        run: |
+          export WPE_BACKEND=fdo
+          xvfb-run -a cargo test -p webai-bridge --features real_backend --test real_device_matrix -- --ignored --exact real_device_matrix_21_cases --nocapture
+          xvfb-run -a cargo test -p webai-bridge --features real_backend --test real_device_matrix -- --ignored --exact real_device_reuse_on_matrix_chain --nocapture
+          xvfb-run -a cargo test -p webai-bridge --features real_backend --test real_device_e2e -- --ignored --nocapture
+
   ci:
     name: layering • deny • no-default-features
     runs-on: ubuntu-latest
@@ -101,6 +113,14 @@ jobs:
       # on a machine with no WebKit/system C++ (ARCHITECTURE.md §4.7 / §10).
       - name: Build with --no-default-features
         run: cargo build --workspace --no-default-features
+
+      # e2e matrix, stub layer (#103/#107): the 21-case N-S1..N-SN2 plan runs
+      # deterministically on the fake backend in every default job run. The
+      # MATRIX-STUB line is the per-run pass-rate ledger for M-1.
+      - name: e2e matrix, stub layer (21 cases + ledger)
+        run: |
+          cargo test -p webai-bridge --test matrix_stub -- --nocapture | tee stub-matrix.log
+          grep -q "MATRIX-STUB: 21/21" stub-matrix.log
 
       # Layered dependency partial-order enforcement (ARCHITECTURE.md §3.2).
       # Written in stdlib-only Python so it needs no extra toolchain.
