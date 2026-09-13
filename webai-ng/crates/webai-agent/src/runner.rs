@@ -158,7 +158,7 @@ impl AgentRunner {
             }
 
             // The verb for this iteration (deterministic for the harness).
-            let verb = self.next_verb(steps.len());
+            let verb = self.next_verb(steps.len(), prompt);
 
             // Guard: duplicate observation (stuck detection).
             if let Some(obs) = &last_observation {
@@ -232,9 +232,18 @@ impl AgentRunner {
     }
 
     /// Deterministic verb selection for the harness loop.
-    fn next_verb(&self, index: usize) -> String {
+    fn next_verb(&self, index: usize, prompt: &str) -> String {
         match index {
-            0 => "navigate".to_string(),
+            0 => {
+                // Read-intent prompts summarize the CURRENT page instead of
+                // navigating: the TUI user asking "界面上有什么 / 页面内容总结"
+                // wants page content, not a reload of the default URL.
+                if is_read_intent(prompt) {
+                    "get_text".to_string()
+                } else {
+                    "navigate".to_string()
+                }
+            }
             1 => "click".to_string(),
             _ => "get_text".to_string(),
         }
@@ -244,6 +253,30 @@ impl AgentRunner {
     pub fn summarise(&self, turns: Vec<Turn>) -> super::summariser::SummarisedHistory {
         self.summariser.summarise(&turns)
     }
+}
+
+/// Read-intent detection for single-turn info prompts (deterministic stub
+/// policy until LLM verb selection lands): 界面上有什么 / 读一下 / 总结页面 /
+/// what is on the page / describe / summarize, etc. must read page content
+/// (get_text) instead of navigating.
+pub fn is_read_intent(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    // Explicit navigation intent wins over read hints ("打开...并读取标题"
+    // is primarily a navigate task with a read tail).
+    const NAVIGATE_HINTS: &[&str] = &[
+        "打开", "访问", "跳转", "导航", "navigate to", "open ", "go to", "goto ",
+    ];
+    if NAVIGATE_HINTS.iter().any(|h| lower.contains(h)) {
+        return false;
+    }
+    const READ_HINTS: &[&str] = &[
+        "界面上有什么", "界面有什么", "页面内容", "内容总结", "总结一下", "读取",
+        "读一下", "读出", "查看", "显示什么", "有什么内容", "标题是什么", "页面上",
+        "读文本", "全文", "页面上写了", "what is on", "what's on", "read the page",
+        "describe the page", "page content", "summarize the page", "summary of the page",
+        "what does the page", "read out",
+    ];
+    READ_HINTS.iter().any(|h| lower.contains(h))
 }
 
 /// Convert a terminal outcome into a stable structured code string.
@@ -402,4 +435,32 @@ mod tests {
         let out = summar.summarise(&turns);
         assert!(out.open_goals.iter().any(|g| g.contains("金证")));
     }
+
+    #[tokio::test]
+    async fn read_intent_prompt_routes_to_get_text_not_navigate() {
+        let (r, _s) = runner(true);
+        let exec = StubExecutor::default();
+        let llm = LlmClient::with_profile_stub("stub");
+        for prompt in ["界面上有什么", "页面内容总结一下", "What is on the page?"] {
+            let (steps, outcome, _) = r.run(prompt, &exec, &llm).await;
+            assert!(matches!(outcome, StepOutcome::Done { .. }));
+            assert_eq!(steps.len(), 1);
+            assert_eq!(
+                steps[0].tool_name, "get_text",
+                "read-intent prompt {prompt:?} must read content, not navigate"
+            );
+        }
+    }
+
+    #[test]
+    fn is_read_intent_matrix() {
+        for yes in ["界面上有什么", "页面内容总结", "读一下当前页", "what is on the page",
+                    "Summarize the page content", "describe the page"] {
+            assert!(is_read_intent(yes), "must classify {yes:?} as read-intent");
+        }
+        for no in ["打开百度", "打开 example.com 然后点击搜索", "navigate to x.com"] {
+            assert!(!is_read_intent(no), "must NOT classify {no:?} as read-intent");
+        }
+    }
+
 }

@@ -9,10 +9,12 @@ log() { printf '%s\n' "$*" >&2; }
 
 {
   sleep 2                 # let the UI reach the event loop
-  printf 'hello tui\r'    # submit a prompt
+  printf '打开百度\r'      # navigate-intent prompt -> [navigate] step
   sleep 4                 # let the agent runner produce steps + done
+  printf '界面上有什么\r'   # read-intent prompt -> [get_text] (page content)
+  sleep 4
   printf '\x03'           # Ctrl+C exit
-} | script -qec "stty rows 24 cols 80; timeout 20 $bin" "$out" >/dev/null
+} | script -qec "stty rows 48 cols 80; timeout 24 $bin" "$out" >/dev/null
 
 body=$(python3 - "$out" <<'PY'
 import re,sys
@@ -23,9 +25,13 @@ PY
 if echo "$body" | grep -aq "panicked"; then
   log "FAIL: panic"; tail -c 600 "$out"; rm "$out"; exit 1
 fi
-# Model output is honest-stub: steps [navigate] page loaded, then done.
-if echo "$body" | grep -aq "AI:" && echo "$body" | grep -aq "donewebai: TUI session loop finished"; then
-  log "TUI-SMOKE-OK: prompt round-trip rendered + clean exit"
+# Model output is honest-stub: navigate-intent -> [navigate], then
+# read-intent -> [get_text] (page content summary), then done.
+if echo "$body" | grep -aqF "[navigate]" \
+   && echo "$body" | grep -aqF "[get_text]" \
+   && echo "$body" | grep -aq "AI:" \
+   && echo "$body" | grep -aq "TUI session loop finished"; then
+  log "TUI-SMOKE-OK: navigate+read-intent round-trip rendered + clean exit"
   rm "$out"; exit 0
 fi
-log "FAIL: round-trip missing (prompt/done not rendered)"; tail -c 600 "$out"; rm "$out"; exit 1
+log "FAIL: round-trip missing (navigate/get_text/done not rendered)"; tail -c 800 "$out"; rm "$out"; exit 1
