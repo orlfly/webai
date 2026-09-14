@@ -313,3 +313,78 @@ fn release_gate_unknown_method_is_structured() {
     assert_eq!(err.code, code::method_not_found().code);
     assert_eq!(err.message, "Method not found");
 }
+
+// ---------------------------------------------------------------------------
+// T5 (task tsk-mtx-4 / FR-3): matrix-chain script-memory reuse.
+//
+// The same prompt runs twice through the REAL AgentRunner loop + real
+// `SharedMemoryStore` recall. Each attempt is recorded into a matrix output
+// row ("first" vs "reused"), and the assertion requires the reuse flag to be
+// truthfully derived from the store (first=false, second=true) — never a
+// test counter.
+
+/// A single matrix output row (stub chain). Serialized so CI logs / reports
+/// can consume the reuse flag per attempt.
+struct MatrixCase {
+    attempt: u32,
+    prompt: String,
+    reused_script: bool,
+}
+
+impl MatrixCase {
+    fn record(attempt: u32, prompt: &str, reused_script: bool) -> Self {
+        let case = Self {
+            attempt,
+            prompt: prompt.to_owned(),
+            reused_script,
+        };
+        // Machine-readable line for the matrix output (reuse column).
+        println!(
+            "MATRIX\tFR-3\tattempt={}\tprompt={}\treused_script={}",
+            case.attempt, case.prompt, case.reused_script
+        );
+        case
+    }
+}
+
+#[test]
+fn matrix_chain_same_prompt_marks_first_then_reused_from_real_recall() {
+    let (_reg, disp, memory) = loop_dispatcher("mtx-fr3");
+    let prompt = "导出新浪财经报表";
+    let mk = |id| AcpRequest {
+        id,
+        method: "session/prompt".into(),
+        params: serde_json::json!({ "session_id": "mtx-fr3", "prompt": prompt }),
+    };
+    let reused_of = |events: &[SessionEvent]| match &events[0] {
+        SessionEvent::Step { step } => step.reused_script,
+        _ => false,
+    };
+
+    // Attempt 1: no remembered script yet -> compose fresh.
+    let mut first = Vec::new();
+    let _ = disp.dispatch(&mk(1), &mut |ev| first.push(ev));
+    let first_reused = reused_of(&first);
+    let first_case = MatrixCase::record(1, prompt, first_reused);
+    assert!(!first_case.reused_script, "first attempt composes fresh");
+
+    // The runner's real ScriptMemory remembered the script under this task.
+    assert!(
+        !memory.recall_scripts(prompt, 1).is_empty(),
+        "store must hold the remembered script after attempt 1"
+    );
+
+    // Attempt 2: the SAME prompt -> the real recall hits and marks reused.
+    let mut second = Vec::new();
+    let _ = disp.dispatch(&mk(2), &mut |ev| second.push(ev));
+    let second_reused = reused_of(&second);
+    let second_case = MatrixCase::record(2, prompt, second_reused);
+    assert!(
+        second_case.reused_script,
+        "second attempt reuses remembered script"
+    );
+
+    // Matrix output distinguishes first vs reuse for the same prompt.
+    assert_ne!(first_case.reused_script, second_case.reused_script);
+    assert!(!first_case.reused_script && second_case.reused_script);
+}

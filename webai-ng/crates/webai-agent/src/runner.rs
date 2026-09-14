@@ -298,7 +298,22 @@ mod tests {
     use webai_llm::LlmClient;
 
     fn runner(enabled: bool) -> (AgentRunner, SharedMemoryStore) {
-        let store = SharedMemoryStore::new();
+        // Hermetic: point the persisted-index path at a unique temp dir so
+        // the store never reopens a stale `.webai/vec` left by a prior
+        // run (which would degrade the store to "memory disabled" and make
+        // these FR-3 reuse tests fail non-hermetically).
+        let dir = std::env::temp_dir().join(format!(
+            "webai-runner-mem-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let store = SharedMemoryStore::from_config(webai_memory::MemoryConfig {
+            index_path: dir,
+            ..Default::default()
+        });
         let summar = HistorySummariser::default();
         let r = AgentRunner::new(
             RunConfig {
