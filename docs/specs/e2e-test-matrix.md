@@ -83,6 +83,11 @@ stub 层全部用例可在 `cargo test` 内以确定性 fake 驱动（已在 bri
 
 **FR-3 真机复用补充**：`real_device_reuse_on_matrix_chain`（#106）输出 `MATRIX-REUSE: first=fresh(...) second=reused(..., all reused_script=true)`。
 
-**提交**：bd0d570（矩阵+产品修复）、fc16216（#104）、32bc42a（#106）。
+**提交**：bd0d570（矩阵+产品修复）、fc16216（#104）、32bc42a（#106）、f365f13（本节）、e42d7e3（#107 CI）、e56a6e7（TUI 截图链路）、02dac29（relay 补全）、46b131e（读意图路由）。
+
+**后续追加 (2026-09-13 用户提问驱动)**
+- 界面截图经 TUI 呈现：新增真机用例 `screenshot_pipeline_renders_real_device_screenshot`（webai-tui/tests/screenshot_render.rs），真机证据 `TUI-SHOT-REAL: rendered kitty 800x600, frame_bytes=6074`（真实 bridge 截图 → ingest → dispatch → encode 全链）；专用 Screenshot 动词改为返回真实 PNG（image_path）。
+- 读意图路由（用户现场报告）：`界面上有什么` 等读取类提问现路由 `get_text`（页面内容总结）而非重复 navigate；`tui_smoke.sh` 升级为驱动 "打开百度 → 界面上有什么" 双意图回路并断言 `[navigate]`+`[get_text]`+done（TUI-SMOKE-OK）。
+- 中断后复验（2026-09-19）：DEVICE-MATRIX 21/21、workspace 281/0、HEAD==origin/main(46b131e) 全部保持。
 
 stub 层当前：0 未通过。
