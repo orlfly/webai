@@ -356,9 +356,17 @@ async fn real_device_reuse_on_matrix_chain() {
 
     // Isolated on-disk store: the default index path (cwd/.webai/vec) would
     // leak remembered scripts across test runs and flip the first run to
-    // reused_script=true.
+    // reused_script=true. A Drop guard guarantees cleanup on EVERY path
+    // (#108): assertion failures / panics no longer leave temp residue.
+    struct MemDirGuard(std::path::PathBuf);
+    impl Drop for MemDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     let mem_dir = std::env::temp_dir().join(format!("webai-matrix-reuse-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&mem_dir);
+    let _mem_guard = MemDirGuard(mem_dir.clone());
     let store = webai_memory::SharedMemoryStore::from_config(webai_memory::MemoryConfig {
         index_path: mem_dir.join("vec"),
         ..Default::default()
@@ -398,5 +406,6 @@ async fn real_device_reuse_on_matrix_chain() {
         steps.len(),
         steps2.len()
     );
-    let _ = std::fs::remove_dir_all(&mem_dir);
+    // #108 AC: the Drop guard owns cleanup; dropping here (end of scope)
+    // leaves no residue on success, and a panic unwind drops it too.
 }
