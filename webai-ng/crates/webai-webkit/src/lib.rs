@@ -179,15 +179,19 @@ impl WebkitBridge {
     /// after startup; that event must not satisfy a navigation wait (seen on
     /// real WPE: `open()` resolved while `location.href` was still
     /// `about:blank`). Loop until the finished event's URI matches the target
-    /// (or a redirect of it), or the overall timeout expires.
-    pub async fn open(&self, url: &str) -> Result<LoadSnapshot, WebkitError> {
+    /// (or a redirect of it), or `timeout_ms` expires.
+    ///
+    /// `timeout_ms` is caller-chosen: real internet pages routinely exceed a
+    /// 15s fixed budget (the old hardcode timed out baidu.com even though the
+    /// page was reachable), so the bridge passes a generous navigation budget.
+    pub async fn open(&self, url: &str, timeout_ms: u64) -> Result<LoadSnapshot, WebkitError> {
         // Canned path (tests).
         if let Some(canned) = self.canned.lock().unwrap().as_ref() {
             if let Some(ev) = canned.load_events.first() {
                 return Ok(ev.clone());
             }
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(15_000);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         {
             let backend = self.backend.lock().unwrap();
             let backend = backend.as_ref().ok_or_else(|| {
@@ -200,7 +204,7 @@ impl WebkitBridge {
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Err(WebkitError::Timeout(15_000));
+                return Err(WebkitError::Timeout(timeout_ms));
             }
             let snapshot = self.wait_for_load(remaining.as_millis() as u64).await?;
             // On real WebKit, `load-changed` reports the (possibly provisional)
@@ -456,7 +460,7 @@ mod tests {
             load_waiters: Arc::new(Mutex::new(Vec::new())),
             canned: Arc::new(Mutex::new(None)),
         };
-        let err = bridge.open("https://example.com").await.unwrap_err();
+        let err = bridge.open("https://example.com", 1_000).await.unwrap_err();
         match err {
             WebkitError::CogLaunch(msg) => assert!(msg.contains("no FFI environment")),
             other => panic!("expected CogLaunch, got {other:?}"),

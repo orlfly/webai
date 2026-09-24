@@ -12,6 +12,11 @@
 //! In a no-FFI environment (dev machine) the `WebkitBridge` canned-response
 //! injection path covers the full dispatch chain (ARCHITECTURE.md §9 layer 3).
 
+/// Navigation budget for host-driven loads (`needs_rust_load`): real internet
+/// pages (redirects, CDN, heavy JS) can exceed short fixed budgets, and a
+/// tight hardcode caused baidu.com to time out at 15s on real WPE.
+const NAVIGATE_TIMEOUT_MS: u64 = 60_000;
+
 use webai_protocol::{
     codes, BrowserToolError, BrowserToolRequest, BrowserToolResponse, Request, Response,
 };
@@ -160,7 +165,7 @@ impl Bridge {
                         "navigate requested needs_rust_load but args.url is missing".into(),
                     ))
                 })?;
-            self.webkit.open(url).await?;
+            self.webkit.open(url, NAVIGATE_TIMEOUT_MS).await?;
             return self.merge_verify_only(req, &module).await;
         }
         self.merge(req, result).await
