@@ -2,6 +2,7 @@ AGENTS.md
 .jcode/
 .env
 /webai-ng/target/
+/target/
 
 # Download test artifacts
 webai-ng/crates/webai-bridge/downloads/

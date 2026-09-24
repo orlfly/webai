@@ -156,8 +156,13 @@ fn run(
         );
     }
 
+    // The tool executor: the real WPE browser bridge under `real_backend`
+    // (drives actual browser verbs end to end), else the prompt-truthful echo
+    // executor in the default no-FFI build.
+    let executor: Arc<dyn webai_agent::runner::ToolExecutor> = build_executor();
+    let executor_for_tui = Arc::clone(&executor);
     let hooks = runtime::LaunchHooks {
-        tui: Box::new(|rt| {
+        tui: Box::new(move |rt| {
             // TUI: run the whole orchestration inside ONE tokio runtime so
             // `tokio::spawn` in SessionBackend has a reactor context (the
             // pre-fix panic "there is no reactor running" came from spawning
@@ -182,7 +187,7 @@ fn run(
                         webai_tui::session::RunnerPromptHandler::new(
                             Arc::clone(&rt.llm),
                             (*rt.memory).clone(),
-                            Arc::new(webai_agent::runner::EchoExecutor),
+                            Arc::clone(&executor_for_tui),
                         ),
                     )),
                 );
@@ -264,6 +269,7 @@ fn run(
             println!("webai: ACP dispatcher assembled; WS transport lands in M6-3");
             Ok(())
         }),
+        headless_exec: Some(executor),
     };
 
     let outcome = runtime::launch(&rt, mode, Some(&hooks), prompt.as_deref())?;
@@ -279,4 +285,21 @@ fn run(
         }
     }
     Ok(())
+}
+
+/// The tool executor for the interactive/headless prompt path. With the
+/// `real_backend` feature the real WPE browser bridge drives the verbs (the
+/// `BridgeToolExecutor` dispatches agent steps through webai-script compose ->
+/// WebKit FFI); the default pure-Rust build uses the prompt-truthful echo
+/// executor (no FFI in the dev machine).
+#[cfg(feature = "real_backend")]
+fn build_executor() -> Arc<dyn webai_agent::runner::ToolExecutor> {
+    use webai_agent::runner::BridgeToolExecutor;
+    let bridge = webai_bridge::Bridge::new(webai_webkit::WebkitBridge::new());
+    Arc::new(BridgeToolExecutor::new(Arc::new(bridge)))
+}
+
+#[cfg(not(feature = "real_backend"))]
+fn build_executor() -> Arc<dyn webai_agent::runner::ToolExecutor> {
+    Arc::new(webai_agent::runner::EchoExecutor)
 }

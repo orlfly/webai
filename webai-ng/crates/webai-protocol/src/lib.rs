@@ -220,6 +220,19 @@ pub struct BrowserToolError {
     pub detail: Option<String>,
 }
 
+impl std::fmt::Display for BrowserToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} [code {}]", self.message, self.code)?;
+        if let Some(phase) = &self.phase {
+            write!(f, " phase={phase}")?;
+        }
+        if let Some(detail) = &self.detail {
+            write!(f, " detail={detail}")?;
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session events (Step / Done / Error)
 // ---------------------------------------------------------------------------

@@ -2152,6 +2152,7 @@ dependencies = [
  "tokio",
  "webai-acp",
  "webai-agent",
+ "webai-bridge",
  "webai-config",
  "webai-tui",
  "webai-webkit",
@@ -2193,6 +2194,7 @@ dependencies = [
  "webai-llm",
  "webai-memory",
  "webai-protocol",
+ "webai-webkit",
 ]
 
 [[package]]

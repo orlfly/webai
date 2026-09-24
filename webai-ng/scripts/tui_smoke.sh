@@ -7,6 +7,9 @@ bin="${1:-target/debug/webai}"
 out="$(mktemp /tmp/webai-tui-smoke.XXXX.log)"
 log() { printf '%s\n' "$*" >&2; }
 
+# Hermetic gate: never hit the LLM network in the smoke run.
+export WEBAI_LLM_DISABLED=1
+
 {
   sleep 2                 # let the UI reach the event loop
   printf 'hello tui\r'    # submit a prompt

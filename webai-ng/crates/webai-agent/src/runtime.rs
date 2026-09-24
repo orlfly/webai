@@ -79,8 +79,9 @@ impl std::fmt::Debug for Runtime {
 /// Assemble the runtime from a config directory.
 pub fn bootstrap(config_dir: &Path) -> Result<Runtime, RuntimeError> {
     let config = webai_config::load_from(config_dir)?;
-    // LLM profile validated by the config loader (fail-fast on unknown).
-    let llm = Arc::new(LlmClient::with_profile_stub(&config.agent.llm));
+    // The real llm.toml profile is wired (validated fail-fast upstream); the
+    // no-network stub is used only when explicitly disabled or unavailable.
+    let llm = Arc::new(build_llm_client(&config));
     // Memory degrades: no mem.toml / backend -> disabled store (main flow runs).
     // M-2 (Kaneo #50): when embd.toml configures a real embedding backend,
     // wire the BGE-M3 adapter into the vector channel so semantic recall
@@ -116,6 +117,47 @@ pub fn bootstrap(config_dir: &Path) -> Result<Runtime, RuntimeError> {
     })
 }
 
+/// Assemble the LLM client for the loaded config: the real `llm.toml` profile
+/// when available (and not disabled), else the honest no-network stub.
+///
+/// `WEBAI_LLM_DISABLED=1` (set by `scripts/rss_sample.py`) forces the stub so
+/// RSS measurement excludes LLM traffic/processes (M-6 contract).
+fn build_llm_client(config: &webai_config::LoadedConfig) -> LlmClient {
+    if std::env::var_os("WEBAI_LLM_DISABLED").is_some() {
+        tracing::info!("WEBAI_LLM_DISABLED=1: using stub LLM (M-6 measurement)");
+        return LlmClient::with_profile_stub(&config.agent.llm);
+    }
+    let profiles = config
+        .llm
+        .profiles
+        .iter()
+        .map(|(name, p)| {
+            (
+                name.clone(),
+                webai_llm::LlmProfile {
+                    model: p.model.clone(),
+                    base_url: p.base_url.clone(),
+                    endpoint: p.endpoint.clone(),
+                    api_key: p.api_key.clone(),
+                    timeout_ms: 120_000,
+                },
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    match LlmClient::from_profiles(profiles, &config.agent.llm) {
+        Ok(c) => c,
+        Err(e) => {
+            // Defensive (the config loader normally validates the profile);
+            // degrade to the honest stub so startup still works.
+            tracing::warn!(
+                "llm profile `{}` unavailable ({e}); using stub",
+                config.agent.llm
+            );
+            LlmClient::with_profile_stub(&config.agent.llm)
+        }
+    }
+}
+
 /// Validate the `--public` gate: pairing credentials must exist when serving
 /// publicly (§3.3 / FR-8). Returns `Err(PublicWithoutPairing)` otherwise.
 pub fn check_public_gate(public: bool, has_pairing: bool) -> Result<(), RuntimeError> {
@@ -144,6 +186,12 @@ pub struct LaunchHooks {
     pub tui: LaunchHook,
     /// ACP serve entry: starts the JSON-RPC dispatcher transports.
     pub serve: LaunchHook,
+    /// Optional executor for headless runs; absent -> the prompt-truthful
+    /// [`crate::runner::EchoExecutor`] (dev). The binary injects the real
+    /// bridge executor under the `real_backend` feature so
+    /// `--headless --prompt "navigate url=..."` drives the actual WPE view
+    /// (M-6 rss_gate).
+    pub headless_exec: Option<std::sync::Arc<dyn crate::runner::ToolExecutor>>,
 }
 
 impl std::fmt::Debug for LaunchHooks {
@@ -177,7 +225,8 @@ pub fn launch(
             Ok(LaunchOutcome::Serve)
         }
         LaunchMode::Headless => {
-            run_headless(rt, prompt.unwrap_or_default())?;
+            let exec = hooks.and_then(|h| h.headless_exec.clone());
+            run_headless(rt, prompt.unwrap_or_default(), exec)?;
             Ok(LaunchOutcome::Headless)
         }
     }
@@ -187,7 +236,11 @@ pub fn launch(
 /// the final observation to stdout. Uses the pass-through executor (headless
 /// runs are script/composition driven; the browser tool lands with the FFI
 /// backend) so the run is honest about what executed.
-fn run_headless(rt: &Runtime, prompt: &str) -> Result<(), RuntimeError> {
+fn run_headless(
+    rt: &Runtime,
+    prompt: &str,
+    exec: Option<std::sync::Arc<dyn crate::runner::ToolExecutor>>,
+) -> Result<(), RuntimeError> {
     use crate::runner::{AgentRunner, EchoExecutor, RunConfig, StepOutcome};
 
     let loop_config = RunConfig {
@@ -199,12 +252,13 @@ fn run_headless(rt: &Runtime, prompt: &str) -> Result<(), RuntimeError> {
     let summariser =
         crate::summariser::HistorySummariser::new(crate::summariser::SummariserConfig::default());
     let runner = AgentRunner::new(loop_config, (*rt.memory).clone(), summariser);
-    // Prompt-truthful executor: headless steps echo the prompt-derived target
-    // (e.g. "打开百度" -> "[navigate] 百度") instead of a canned "page loaded".
-    let exec = EchoExecutor;
+    // Prompt-truthful by default; the binary injects the real bridge executor
+    // under `real_backend` so headless drives the actual WPE view.
+    let exec: std::sync::Arc<dyn crate::runner::ToolExecutor> =
+        exec.unwrap_or_else(|| std::sync::Arc::new(EchoExecutor));
     let runtime = tokio::runtime::Runtime::new().map_err(|e| RuntimeError::Io(e.to_string()))?;
     let (steps, outcome, _plan) =
-        runtime.block_on(async { runner.run(prompt, &exec, &rt.llm).await });
+        runtime.block_on(async { runner.run(prompt, exec.as_ref(), &rt.llm).await });
 
     for step in &steps {
         println!(
@@ -310,7 +364,9 @@ mod tests {
     }
 
     fn llm_toml() -> &'static str {
-        "[cloud]\nmodel = \"test-model\"\nbase_url = \"http://localhost\"\n"
+        // Empty base_url => stub-like: bootstrap wires it, and any completion
+        // fails fast (NoProfile) so headless runs stay hermetic and instant.
+        "[cloud]\nmodel = \"test-model\"\nbase_url = \"\"\n"
     }
 
     #[test]
@@ -368,6 +424,32 @@ mod tests {
         );
         let rt = bootstrap(&dir).unwrap();
         assert!(rt.config.memory.is_some());
+    }
+
+    #[test]
+    fn bootstrap_wires_real_llm_profile_and_honors_disable_env() {
+        let dir = config_dir("realllm");
+        write(&dir.join("agent.toml"), agent_toml());
+        write(
+            &dir.join("llm.toml"),
+            "[cloud]\nmodel = \"m\"\nbase_url = \"http://llm.internal\"\n\
+             endpoint = \"/v1/chat/completions\"\napi_key = \"k\"\n",
+        );
+        let rt = bootstrap(&dir).unwrap();
+        assert_eq!(rt.llm.profile(), "cloud");
+        assert!(
+            !rt.llm.stub_like(),
+            "real base_url profile must be wired, not the stub"
+        );
+
+        // WEBAI_LLM_DISABLED=1 forces the stub path (RSS measurement contract).
+        std::env::set_var("WEBAI_LLM_DISABLED", "1");
+        let rt2 = bootstrap(&dir).unwrap();
+        std::env::remove_var("WEBAI_LLM_DISABLED");
+        assert!(
+            rt2.llm.stub_like(),
+            "disabled env must force the stub client"
+        );
     }
 
     #[test]

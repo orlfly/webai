@@ -65,11 +65,13 @@ impl Default for RunConfig {
     }
 }
 
-/// A fake-capable tool executor injected into the driver. Returns the
-/// observation for a step and whether it "succeeded".
+/// A tool executor injected into the driver. Returns the observation for a
+/// step and whether it "succeeded". Async so the real browser bridge
+/// ([`BridgeToolExecutor`]) can dispatch without blocking the loop.
+#[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync {
     /// Execute a single `verb` tool action with `args`. Returns `(ok, obs)`.
-    fn execute(&self, verb: &str, args: &str) -> (bool, String);
+    async fn execute(&self, verb: &str, args: &str) -> (bool, String);
 }
 
 /// A trivial executor for tests that always succeeds.
@@ -89,8 +91,9 @@ impl Default for StubExecutor {
     }
 }
 
+#[async_trait::async_trait]
 impl ToolExecutor for StubExecutor {
-    fn execute(&self, _verb: &str, _args: &str) -> (bool, String) {
+    async fn execute(&self, _verb: &str, _args: &str) -> (bool, String) {
         if self.always_succeed {
             (true, self.observation.clone())
         } else {
@@ -102,22 +105,124 @@ impl ToolExecutor for StubExecutor {
     }
 }
 
-/// A prompt-truthful executor for the honest-stub path (TUI/headless until the
-/// bridge-backed executor lands): surfaces the composed script's target as the
-/// observation instead of a canned "page loaded", so different prompts produce
-/// different, readable steps.
+/// A prompt-truthful executor for the no-FFI path (TUI/headless default build):
+/// surfaces the composed target/args as the observation instead of a canned
+/// "page loaded", so different prompts produce different, readable steps.
 pub struct EchoExecutor;
 
+#[async_trait::async_trait]
 impl ToolExecutor for EchoExecutor {
-    fn execute(&self, _verb: &str, script: &str) -> (bool, String) {
-        // Composed scripts look like `navigate(百度)`; surface the target.
-        let target = script
-            .split_once('(')
-            .and_then(|(_, rest)| rest.strip_suffix(')'))
-            .unwrap_or(script)
-            .trim()
-            .to_owned();
-        (true, target)
+    async fn execute(&self, _verb: &str, script: &str) -> (bool, String) {
+        let text = if let Ok(json) = serde_json::from_str::<serde_json::Value>(script) {
+            // Model-composed JSON tool args: prefer a readable field, else the
+            // compact JSON (honest view of what the model chose).
+            ["url", "selector", "value", "script", "key"]
+                .iter()
+                .find_map(|k| json.get(*k).and_then(|v| v.as_str()).map(str::to_owned))
+                .unwrap_or_else(|| {
+                    serde_json::to_string(&json).unwrap_or_else(|_| script.to_owned())
+                })
+        } else {
+            // Prompt-derived fallback `verb(target)`: surface the target.
+            script
+                .split_once('(')
+                .and_then(|(_, rest)| rest.strip_suffix(')'))
+                .unwrap_or(script)
+                .trim()
+                .to_owned()
+        };
+        (true, text)
+    }
+}
+
+/// Executor that routes composed tool calls through the real browser bridge
+/// (`webai-bridge::Bridge` -> `WebkitBridge`, FFI when built with
+/// `real_backend`). The composed script is either model-composed JSON tool
+/// args, the prompt-derived `verb(target)` fallback, or the e2e-matrix
+/// `verb key=value` syntax; all are normalized into a `BrowserToolRequest`.
+pub struct BridgeToolExecutor {
+    bridge: std::sync::Arc<webai_bridge::Bridge>,
+}
+
+impl BridgeToolExecutor {
+    pub fn new(bridge: std::sync::Arc<webai_bridge::Bridge>) -> Self {
+        Self { bridge }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolExecutor for BridgeToolExecutor {
+    async fn execute(&self, verb: &str, composed: &str) -> (bool, String) {
+        use webai_protocol::{BrowserToolRequest, BrowserVerb};
+        let wire = runner_verb_to_wire(verb);
+        let verb = BrowserVerb::from_name(&wire);
+        let args = compose_args(verb, composed);
+        let req = BrowserToolRequest { verb, args };
+        match self.bridge.handle_tool_call(&req).await {
+            Ok(resp) if resp.ok => (
+                true,
+                resp.result
+                    .map(|r| serde_json::to_string(&r).unwrap_or_default())
+                    .unwrap_or_else(|| "ok".into()),
+            ),
+            Ok(resp) => (
+                false,
+                resp.error
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "tool call failed".into()),
+            ),
+            Err(e) => (false, e.to_string()),
+        }
+    }
+}
+
+/// Map the driver's camelCase verb names to the protocol wire names.
+fn runner_verb_to_wire(verb: &str) -> String {
+    match verb {
+        "getText" => "get_text".into(),
+        "getHtml" => "get_html".into(),
+        "pressKey" => "press_key".into(),
+        "accessibilityTree" => "accessibility_tree".into(),
+        other => other.to_owned(),
+    }
+}
+
+/// Normalize a composed script into `BrowserToolRequest.args`:
+/// 1. valid JSON wins (model-composed args);
+/// 2. the e2e-matrix `key=value` syntax inside `verb(...)` (rss_sample's
+///    `navigate url=http://...`);
+/// 3. `verb(target)` fallback mapped per-verb to the args the script
+///    composer requires (url / selector / key / ...);
+/// 4. otherwise `{}` (compose surfaces a structured MissingArg failure).
+fn compose_args(verb: webai_protocol::BrowserVerb, composed: &str) -> serde_json::Value {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(composed) {
+        return json;
+    }
+    let target = composed
+        .split_once('(')
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .map(str::trim)
+        .unwrap_or(composed.trim());
+    // Matrix syntax `key=value ...` (only when the `=` is a real key=value,
+    // not a URL like `http://host`).
+    for token in target.split_whitespace() {
+        if let Some((k, v)) = token.split_once('=') {
+            let k = k.trim();
+            if !k.is_empty() && !k.contains(['/', ':', '.']) {
+                return serde_json::json!({ k: v.trim_matches('"') });
+            }
+        }
+    }
+    use webai_protocol::BrowserVerb::*;
+    match verb {
+        Navigate => serde_json::json!({ "url": target }),
+        Click | Hover => serde_json::json!({ "selector": target }),
+        Fill => serde_json::json!({ "selector": target, "value": target }),
+        PressKey => serde_json::json!({ "key": target }),
+        Evaluate => serde_json::json!({ "script": target }),
+        Download => serde_json::json!({ "url": target, "filename": "download.bin" }),
+        Drag => serde_json::json!({ "source": target, "target": target }),
+        Screenshot | Snapshot | GetText | GetHtml | AccessibilityTree => serde_json::json!({}),
     }
 }
 
@@ -197,7 +302,7 @@ impl AgentRunner {
             let observation;
             if let Some(hit) = reused_hit {
                 composed = hit.entry.script.clone();
-                observation = exec.execute(&verb, &composed).1;
+                observation = exec.execute(&verb, &composed).await.1;
                 llm_calls_for_step = 0;
             } else {
                 // Fresh generation: one LLM call to compose a script
@@ -206,7 +311,7 @@ impl AgentRunner {
                 let (calls, script) = self.compose_script(llm, &verb, prompt).await;
                 llm_calls_for_step = calls;
                 composed = script;
-                observation = exec.execute(&verb, &composed).1;
+                observation = exec.execute(&verb, &composed).await.1;
             }
 
             steps.push(AgentStep {
@@ -256,7 +361,11 @@ impl AgentRunner {
         self.llm_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let target = infer_target(prompt, verb);
-        let model_prompt = format!("compose a JavaScript script to {verb} for: {prompt}");
+        let model_prompt = format!(
+            "Output ONLY a JSON object with the tool arguments for the bridge \
+             verb `{verb}` to accomplish this: {prompt}. \
+             Example for navigate: {{\"url\":\"https://example.com\"}}"
+        );
         let composed = match llm.complete(&model_prompt).await {
             Ok(text) if !text.trim().is_empty() => text.trim().to_owned(),
             _ => format!("{verb}({target})"),
@@ -474,12 +583,106 @@ mod tests {
         assert_eq!(click2[0].observation.as_deref(), Some("搜索按钮"));
     }
 
-    #[test]
-    fn echo_executor_reports_composed_target() {
+    #[tokio::test]
+    async fn echo_executor_reports_composed_target() {
         let e = EchoExecutor;
-        assert_eq!(e.execute("navigate", "navigate(百度)").1, "百度");
-        assert_eq!(e.execute("getText", "getText(新浪报表)").1, "新浪报表");
+        assert_eq!(e.execute("navigate", "navigate(百度)").await.1, "百度");
+        assert_eq!(e.execute("getText", "getText(新浪报表)").await.1, "新浪报表");
         // No parentheses: the script text is reported verbatim.
-        assert_eq!(e.execute("read", "read").1, "read");
+        assert_eq!(e.execute("read", "read").await.1, "read");
+        // Model-composed JSON args: a readable field wins over raw JSON.
+        assert_eq!(
+            e.execute("navigate", r#"{"url":"https://a.b"}"#).await.1,
+            "https://a.b"
+        );
+    }
+
+    #[test]
+    fn compose_args_fallback_handles_matrix_json_and_verb_parens() {
+        use webai_protocol::BrowserVerb;
+        // Matrix syntax `key=value` inside verb(...) (rss_sample's prompt).
+        assert_eq!(
+            compose_args(
+                BrowserVerb::Navigate,
+                "navigate(url=http://127.0.0.1:9/a.html)"
+            ),
+            serde_json::json!({ "url": "http://127.0.0.1:9/a.html" })
+        );
+        // Bare `verb(target)` fallback maps per-verb.
+        assert_eq!(
+            compose_args(BrowserVerb::Click, "click(#btn)"),
+            serde_json::json!({ "selector": "#btn" })
+        );
+        assert_eq!(
+            compose_args(BrowserVerb::PressKey, "pressKey(Enter)"),
+            serde_json::json!({ "key": "Enter" })
+        );
+        // Valid JSON (model-composed) always wins.
+        assert_eq!(
+            compose_args(BrowserVerb::Navigate, r#"{"url":"https://x.test"}"#),
+            serde_json::json!({ "url": "https://x.test" })
+        );
+        // Verbs that take no args degrade to {} (compose surfaces a
+        // structured MissingArg failure if one is actually required).
+        assert_eq!(
+            compose_args(BrowserVerb::GetText, "getText(anything)"),
+            serde_json::json!({})
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_executor_dispatches_through_real_bridge_dispatch_chain() {
+        // Canned WebkitBackend (no FFI): the FULL agent -> bridge ->
+        // script-compose -> merge chain runs, proving the real executor wiring
+        // without a WPE device. The runner's execute() -> BridgeToolExecutor
+        // -> handle_tool_call path is what the TUI/headless use under
+        // `real_backend`.
+        let bridge = std::sync::Arc::new(webai_bridge::Bridge::new(
+            webai_webkit::WebkitBridge::with_canned(webai_webkit::CannedBackend {
+                evaluate_result: Some(serde_json::json!({
+                    "execute": { "ok": true, "stage": "execute" },
+                    "verify": { "ok": true, "stage": "verify" },
+                    "args": {}
+                })),
+                ..Default::default()
+            }),
+        ));
+        let exec = BridgeToolExecutor::new(bridge);
+
+        // Model-composed JSON args drive the bridge end to end.
+        let (ok, obs) = exec
+            .execute("navigate", r#"{"url":"https://x.test"}"#)
+            .await;
+        assert!(ok, "observation: {obs}");
+        assert!(obs.contains("verify"), "two-phase result: {obs}");
+
+        // Matrix verb syntax (rss_sample style) reaches the same path.
+        let (ok, _) = exec
+            .execute("getText", "getText(url=http://127.0.0.1:9/a.html)")
+            .await;
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn bridge_executor_surfaces_phase_failure_structured() {
+        let bridge = std::sync::Arc::new(webai_bridge::Bridge::new(
+            webai_webkit::WebkitBridge::with_canned(webai_webkit::CannedBackend {
+                evaluate_result: Some(serde_json::json!({
+                    "execute": { "ok": false, "stage": "execute", "error": "element not found" },
+                    "verify": { "ok": false, "stage": "verify" },
+                    "args": {}
+                })),
+                ..Default::default()
+            }),
+        ));
+        let exec = BridgeToolExecutor::new(bridge);
+        let (ok, obs) = exec
+            .execute("click", "{\"selector\":\"#missing\"}")
+            .await;
+        assert!(!ok);
+        assert!(
+            obs.contains("execute"),
+            "failure must carry the failing phase: {obs}"
+        );
     }
 }

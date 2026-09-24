@@ -165,6 +165,29 @@ impl LlmClient {
         Ok(client)
     }
 
+    /// Construct directly from already-parsed profiles (no I/O). The profile
+    /// must exist; the config loader validates this fail-fast upstream. This
+    /// is how `webai-agent::runtime` wires the real `llm.toml` profiles
+    /// (instead of the no-network stub) while keeping bootstrap synchronous.
+    pub fn from_profiles(
+        profiles: std::collections::HashMap<String, LlmProfile>,
+        profile: &str,
+    ) -> Result<Self, LlmError> {
+        if !profiles.contains_key(profile) {
+            return Err(LlmError::UnknownProfile(profile.to_owned()));
+        }
+        Ok(Self {
+            profile: profile.to_owned(),
+            profiles,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            #[cfg(test)]
+            scripted: None,
+        })
+    }
+
     /// Synchronous stub constructor for a named provider profile (no I/O).
     pub fn with_profile_stub(profile: &str) -> Self {
         let mut profiles = HashMap::new();
@@ -207,6 +230,16 @@ impl LlmClient {
     /// Names of every configured profile.
     pub fn profile_names(&self) -> Vec<String> {
         self.profiles.keys().cloned().collect()
+    }
+
+    /// Whether the active profile is stub-like (no `base_url`, so it can never
+    /// reach a model). Used by callers that must distinguish "honest stub"
+    /// from "real model wired" (e.g. RSS sampling disables the LLM).
+    pub fn stub_like(&self) -> bool {
+        self.profiles
+            .get(&self.profile)
+            .map(|p| p.base_url.trim().is_empty())
+            .unwrap_or(true)
     }
 
     /// Perform a streaming completion. In stub/scripted mode returns a canned
@@ -375,6 +408,7 @@ fn text_stream(text: String) -> impl Stream<Item = Delta> {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::io::{Read, Write};
 
     #[tokio::test]
     async fn chat_stream_emits_scripted_deltas_in_order() {
@@ -448,6 +482,55 @@ mod tests {
         let client = LlmClient::with_profile_stub("stub");
         let err = client.complete("anything").await.unwrap_err();
         assert!(matches!(err, LlmError::NoProfile(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn from_profiles_rejects_unknown_profile_without_io() {
+        let err = LlmClient::from_profiles(HashMap::new(), "ghost").unwrap_err();
+        assert!(matches!(err, LlmError::UnknownProfile(ref p) if p == "ghost"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_profile_completes_against_local_server() {
+        // Serve one OpenAI-compatible completion response over loopback and
+        // assert the real client posts to base_url+endpoint and parses the
+        // content — the "real LLM wired" path end to end, no external dep.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::task::spawn(async move {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap();
+            let body = "{\"choices\":[{\"message\":{\"content\":\"real-model-reply\"}}]}";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "local".into(),
+            LlmProfile {
+                model: "test-model".into(),
+                base_url: format!("http://{addr}"),
+                endpoint: "/v1/chat/completions".into(),
+                api_key: "k".into(),
+                timeout_ms: 1_000,
+            },
+        );
+        let client = LlmClient::from_profiles(profiles, "local").unwrap();
+        assert!(!client.stub_like(), "real base_url must not be stub-like");
+        let out = client.complete("hi").await.unwrap();
+        assert_eq!(out, "real-model-reply");
+        let req = server.await.unwrap();
+        assert!(
+            req.starts_with("POST /v1/chat/completions"),
+            "client must hit base_url+endpoint: {req}"
+        );
     }
 
     // A client whose only profile points at a closed local port: every

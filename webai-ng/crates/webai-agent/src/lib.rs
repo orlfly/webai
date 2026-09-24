@@ -24,8 +24,8 @@ pub use plan_loop::{
     STATE_BLOCK_MARKER,
 };
 pub use runner::{
-    outcome_code, AgentRunner, AgentStep, EchoExecutor, RunConfig, StepOutcome, StubExecutor,
-    ToolExecutor,
+    outcome_code, AgentRunner, AgentStep, BridgeToolExecutor, EchoExecutor, RunConfig, StepOutcome,
+    StubExecutor, ToolExecutor,
 };
 pub use runtime::{
     bootstrap, build_agent_loop, check_public_gate, launch, memory_store, resume_transcript,
