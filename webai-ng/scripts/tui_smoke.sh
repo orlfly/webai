@@ -23,8 +23,11 @@ PY
 if echo "$body" | grep -aq "panicked"; then
   log "FAIL: panic"; tail -c 600 "$out"; rm "$out"; exit 1
 fi
-# Model output is honest-stub: steps [navigate] page loaded, then done.
-if echo "$body" | grep -aq "AI:" && echo "$body" | grep -aq "donewebai: TUI session loop finished"; then
+# Model output is prompt-truthful: the step echoes the typed target
+# (AI: [getText] hello tui) — never a canned "[navigate] page loaded".
+# The pty capture collapses spaces between cells, so match tokens with 0+
+# whitespace ([[:space:]]*).
+if echo "$body" | grep -aqE "AI:[[:space:]]*\[getText\][[:space:]]*hello[[:space:]]*tui" && echo "$body" | grep -aq "donewebai: TUI session loop finished"; then
   log "TUI-SMOKE-OK: prompt round-trip rendered + clean exit"
   rm "$out"; exit 0
 fi

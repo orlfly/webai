@@ -188,7 +188,7 @@ pub fn launch(
 /// runs are script/composition driven; the browser tool lands with the FFI
 /// backend) so the run is honest about what executed.
 fn run_headless(rt: &Runtime, prompt: &str) -> Result<(), RuntimeError> {
-    use crate::runner::{AgentRunner, RunConfig, StepOutcome, StubExecutor};
+    use crate::runner::{AgentRunner, EchoExecutor, RunConfig, StepOutcome};
 
     let loop_config = RunConfig {
         max_steps: 30,
@@ -199,7 +199,9 @@ fn run_headless(rt: &Runtime, prompt: &str) -> Result<(), RuntimeError> {
     let summariser =
         crate::summariser::HistorySummariser::new(crate::summariser::SummariserConfig::default());
     let runner = AgentRunner::new(loop_config, (*rt.memory).clone(), summariser);
-    let exec = StubExecutor::default();
+    // Prompt-truthful executor: headless steps echo the prompt-derived target
+    // (e.g. "打开百度" -> "[navigate] 百度") instead of a canned "page loaded".
+    let exec = EchoExecutor;
     let runtime = tokio::runtime::Runtime::new().map_err(|e| RuntimeError::Io(e.to_string()))?;
     let (steps, outcome, _plan) =
         runtime.block_on(async { runner.run(prompt, &exec, &rt.llm).await });

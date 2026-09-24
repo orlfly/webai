@@ -14,7 +14,7 @@
 use webai_llm::LlmClient;
 use webai_memory::{ScriptMemoryEntry, SharedMemoryStore};
 
-use super::plan_loop::{requires_plan, LoopError, LoopGuards};
+use super::plan_loop::{infer_target, infer_verb, requires_plan, LoopError, LoopGuards};
 use super::script_memory::ScriptMemory;
 use super::summariser::{HistorySummariser, Turn};
 
@@ -102,6 +102,25 @@ impl ToolExecutor for StubExecutor {
     }
 }
 
+/// A prompt-truthful executor for the honest-stub path (TUI/headless until the
+/// bridge-backed executor lands): surfaces the composed script's target as the
+/// observation instead of a canned "page loaded", so different prompts produce
+/// different, readable steps.
+pub struct EchoExecutor;
+
+impl ToolExecutor for EchoExecutor {
+    fn execute(&self, _verb: &str, script: &str) -> (bool, String) {
+        // Composed scripts look like `navigate(百度)`; surface the target.
+        let target = script
+            .split_once('(')
+            .and_then(|(_, rest)| rest.strip_suffix(')'))
+            .unwrap_or(script)
+            .trim()
+            .to_owned();
+        (true, target)
+    }
+}
+
 /// The orchestration driver. Counts LLM calls so M-2 reuse ratios can be
 /// asserted, and holds a `ScriptMemory` facade.
 pub struct AgentRunner {
@@ -157,8 +176,9 @@ impl AgentRunner {
                 });
             }
 
-            // The verb for this iteration (deterministic for the harness).
-            let verb = self.next_verb(steps.len());
+            // The verb for this iteration: step 0 derives from the prompt (the
+            // act the user asked for); later plan steps follow the chain.
+            let verb = self.next_verb(steps.len(), prompt);
 
             // Guard: duplicate observation (stuck detection).
             if let Some(obs) = &last_observation {
@@ -173,14 +193,19 @@ impl AgentRunner {
             let reused_hit = self.memory.reuse(&verb, prompt);
             let was_reused = reused_hit.is_some();
             let llm_calls_for_step;
+            let composed;
             let observation;
             if let Some(hit) = reused_hit {
-                observation = exec.execute(&verb, &hit.entry.script).1;
+                composed = hit.entry.script.clone();
+                observation = exec.execute(&verb, &composed).1;
                 llm_calls_for_step = 0;
             } else {
-                // Fresh generation: one LLM call to compose a script.
-                llm_calls_for_step = self.use_llm_once(llm, &verb, prompt).await;
-                let composed = format!("script_for_{verb}");
+                // Fresh generation: one LLM call to compose a script
+                // (best-effort; a stub/unreachable model falls back to a
+                // prompt-derived script so the loop stays responsive).
+                let (calls, script) = self.compose_script(llm, &verb, prompt).await;
+                llm_calls_for_step = calls;
+                composed = script;
                 observation = exec.execute(&verb, &composed).1;
             }
 
@@ -196,7 +221,7 @@ impl AgentRunner {
                 task: prompt.to_string(),
                 verb: verb.clone(),
                 url: "https://example.com".into(),
-                script: format!("script_for_{verb}"),
+                script: composed.clone(),
                 tags: vec!["session:test".into()],
                 id: format!("{verb}-{prompt}"),
             };
@@ -221,22 +246,31 @@ impl AgentRunner {
         (steps, outcome, plan_injected)
     }
 
-    /// Consume one LLM call (counted) and return its count.
-    async fn use_llm_once(&self, llm: &LlmClient, verb: &str, prompt: &str) -> u32 {
+    /// Consume one LLM call (counted) and return `(call_count, composed)`.
+    ///
+    /// The model's output is the composed script when available; a stub or
+    /// unreachable model (deterministic error, no retry burn) falls back to a
+    /// prompt-derived `verb(target)` script so the loop stays honest and
+    /// prompt-responsive without a live model.
+    async fn compose_script(&self, llm: &LlmClient, verb: &str, prompt: &str) -> (u32, String) {
         self.llm_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let _ = llm
-            .complete(&format!("compose a script to {verb}: {prompt}"))
-            .await;
-        1
+        let target = infer_target(prompt, verb);
+        let model_prompt = format!("compose a JavaScript script to {verb} for: {prompt}");
+        let composed = match llm.complete(&model_prompt).await {
+            Ok(text) if !text.trim().is_empty() => text.trim().to_owned(),
+            _ => format!("{verb}({target})"),
+        };
+        (1, composed)
     }
 
-    /// Deterministic verb selection for the harness loop.
-    fn next_verb(&self, index: usize) -> String {
+    /// Verb selection for the loop: step 0 derives from the prompt; later plan
+    /// steps follow the canonical multi-step chain.
+    fn next_verb(&self, index: usize, prompt: &str) -> String {
         match index {
-            0 => "navigate".to_string(),
+            0 => infer_verb(prompt).to_string(),
             1 => "click".to_string(),
-            _ => "get_text".to_string(),
+            _ => "getText".to_string(),
         }
     }
 
@@ -416,5 +450,36 @@ mod tests {
         ];
         let out = summar.summarise(&turns);
         assert!(out.open_goals.iter().any(|g| g.contains("金证")));
+    }
+
+    #[test]
+    fn different_prompts_dispatch_different_verbs_and_targets() {
+        // The loop must be prompt-driven: "打开百度" dispatches navigate and
+        // observes 百度; "点击搜索按钮" dispatches click and observes 搜索按钮 —
+        // never a canned "[navigate] page loaded" for both inputs.
+        let (r, _s) = runner(true);
+        let llm = LlmClient::with_profile_stub("stub");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let stub = StubExecutor::default();
+        let (open, _, _) = rt.block_on(r.run("打开百度", &stub, &llm));
+        let (click, _, _) = rt.block_on(r.run("点击搜索按钮", &stub, &llm));
+        assert_eq!(open[0].tool_name, "navigate");
+        assert_eq!(click[0].tool_name, "click");
+
+        // With the honest echo executor the observations carry the target.
+        let echo = EchoExecutor;
+        let (open2, _, _) = rt.block_on(r.run("打开百度", &echo, &llm));
+        let (click2, _, _) = rt.block_on(r.run("点击搜索按钮", &echo, &llm));
+        assert_eq!(open2[0].observation.as_deref(), Some("百度"));
+        assert_eq!(click2[0].observation.as_deref(), Some("搜索按钮"));
+    }
+
+    #[test]
+    fn echo_executor_reports_composed_target() {
+        let e = EchoExecutor;
+        assert_eq!(e.execute("navigate", "navigate(百度)").1, "百度");
+        assert_eq!(e.execute("getText", "getText(新浪报表)").1, "新浪报表");
+        // No parentheses: the script text is reported verbatim.
+        assert_eq!(e.execute("read", "read").1, "read");
     }
 }

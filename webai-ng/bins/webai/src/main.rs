@@ -174,15 +174,15 @@ fn run(
                     runtime::build_agent_loop(rt),
                     webai_agent::memory_store(rt),
                 );
-                // Real prompt path: the M4 orchestration driver with the same
-                // honest stub executor as headless (script composition drives
-                // the browser verbs; the FFI backend attaches via features).
+                // Real prompt path: the M4 orchestration driver with the
+                // prompt-truthful echo executor (script composition drives the
+                // browser verbs; the FFI backend attaches via features).
                 let handler: Arc<dyn webai_tui::session::PromptHandler> = Arc::new(
                     webai_tui::session::RunnerPromptHandlerShared(Arc::new(
                         webai_tui::session::RunnerPromptHandler::new(
                             Arc::clone(&rt.llm),
                             (*rt.memory).clone(),
-                            Arc::new(webai_agent::runner::StubExecutor::default()),
+                            Arc::new(webai_agent::runner::EchoExecutor),
                         ),
                     )),
                 );

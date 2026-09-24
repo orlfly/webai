@@ -19,9 +19,13 @@ pub mod session;
 pub mod summariser;
 pub mod tools;
 
-pub use plan_loop::{requires_plan, LoopError, LoopGuards, PLAN_DIRECTIVE, STATE_BLOCK_MARKER};
+pub use plan_loop::{
+    infer_target, infer_verb, requires_plan, LoopError, LoopGuards, PLAN_DIRECTIVE,
+    STATE_BLOCK_MARKER,
+};
 pub use runner::{
-    outcome_code, AgentRunner, AgentStep, RunConfig, StepOutcome, StubExecutor, ToolExecutor,
+    outcome_code, AgentRunner, AgentStep, EchoExecutor, RunConfig, StepOutcome, StubExecutor,
+    ToolExecutor,
 };
 pub use runtime::{
     bootstrap, build_agent_loop, check_public_gate, launch, memory_store, resume_transcript,

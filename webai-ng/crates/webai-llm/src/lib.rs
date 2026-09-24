@@ -222,11 +222,24 @@ impl LlmClient {
             return Ok(text_stream(text));
         }
         // Real provider path: retry with backoff (3x, 0.5s/1s/2s).
+        // Deterministic errors (unknown/stub profile, empty completion) are
+        // never retried: retrying cannot change them, and a stub profile
+        // would otherwise burn 1.5s of fake backoff per call.
         let mut attempt = 0;
         let mut last_err = None;
         while attempt < 3 {
             match self.complete_once(messages).await {
                 Ok(text) => return Ok(text_stream(text)),
+                Err(e)
+                    if matches!(
+                        e,
+                        LlmError::NoProfile(_)
+                            | LlmError::UnknownProfile(_)
+                            | LlmError::EmptyCompletion
+                    ) =>
+                {
+                    return Err(e)
+                }
                 Err(e) => {
                     last_err = Some(e);
                     attempt += 1;
@@ -262,6 +275,14 @@ impl LlmClient {
             .profiles
             .get(&self.profile)
             .ok_or_else(|| LlmError::UnknownProfile(self.profile.clone()))?;
+        // A stub profile (empty base_url) can never complete: fail fast
+        // instead of POSTing to "" and burning the retry budget.
+        if profile.base_url.trim().is_empty() {
+            return Err(LlmError::NoProfile(format!(
+                "profile `{}` has no base_url (stub profile cannot complete)",
+                self.profile
+            )));
+        }
         let url = format!(
             "{}{}",
             profile.base_url.trim_end_matches('/'),
@@ -417,6 +438,16 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, LlmError::UnknownProfile(ref p) if p == "ghost"));
+    }
+
+    #[tokio::test]
+    async fn stub_profile_fails_fast_without_http_or_retry() {
+        // A stub profile has no base_url: completing must return a
+        // deterministic NoProfile error immediately (no HTTP, no retry
+        // backoff), which is what keeps the agent loop prompt-responsive.
+        let client = LlmClient::with_profile_stub("stub");
+        let err = client.complete("anything").await.unwrap_err();
+        assert!(matches!(err, LlmError::NoProfile(_)), "got {err:?}");
     }
 
     // A client whose only profile points at a closed local port: every
