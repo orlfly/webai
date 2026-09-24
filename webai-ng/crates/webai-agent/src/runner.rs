@@ -368,7 +368,14 @@ impl AgentRunner {
         );
         let composed = match llm.complete(&model_prompt).await {
             Ok(text) if !text.trim().is_empty() => text.trim().to_owned(),
-            _ => format!("{verb}({target})"),
+            Ok(_) => format!("{verb}({target})"),
+            Err(e) => {
+                tracing::warn!(
+                    verb,
+                    "llm compose failed ({e}); falling back to prompt-derived script"
+                );
+                format!("{verb}({target})")
+            }
         };
         (1, composed)
     }

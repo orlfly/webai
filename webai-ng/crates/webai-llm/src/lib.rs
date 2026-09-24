@@ -62,6 +62,10 @@ pub enum LlmError {
     UnknownProfile(String),
     #[error("provider request failed: {0}")]
     Provider(String),
+    /// The provider rejected the request with a 4xx that retrying cannot fix
+    /// (auth, balance, permission, rate-limit policy) — surface, don't retry.
+    #[error("provider rejected request: HTTP {status} ({detail})")]
+    Rejected { status: u16, detail: String },
     #[error("empty completion")]
     EmptyCompletion,
     #[error("request timed out after {0}ms")]
@@ -268,6 +272,7 @@ impl LlmClient {
                         e,
                         LlmError::NoProfile(_)
                             | LlmError::UnknownProfile(_)
+                            | LlmError::Rejected { .. }
                             | LlmError::EmptyCompletion
                     ) =>
                 {
@@ -339,6 +344,19 @@ impl LlmClient {
             .map_err(|e| LlmError::Provider(e.to_string()))?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
+            // 4xx (other than 429 rate-limit, which may recover) is a
+            // deterministic rejection: retrying cannot fix a missing balance
+            // (HTTP 402) or bad credentials (401/403), so fail fast.
+            if (400..500).contains(&status) && status != 429 {
+                let detail = resp
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                return Err(LlmError::Rejected { status, detail });
+            }
             return Err(LlmError::Provider(format!("HTTP {status}")));
         }
         let json: serde_json::Value = resp
@@ -531,6 +549,52 @@ mod tests {
             req.starts_with("POST /v1/chat/completions"),
             "client must hit base_url+endpoint: {req}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_4xx_rejected_fails_fast_without_retries() {
+        // HTTP 402 (Insufficient Balance) must surface as Rejected without the
+        // 3x retry backoff burn — retrying cannot fix a missing balance.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::task::spawn(async move {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).unwrap();
+            let body = r#"{"error":{"message":"Insufficient Balance"}}"#;
+            let resp = format!(
+                "HTTP/1.1 402 Payment Required\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "poor".into(),
+            LlmProfile {
+                model: "m".into(),
+                base_url: format!("http://{addr}"),
+                endpoint: "/v1/chat/completions".into(),
+                api_key: "k".into(),
+                timeout_ms: 1_000,
+            },
+        );
+        let client = LlmClient::from_profiles(profiles, "poor").unwrap();
+        let start = std::time::Instant::now();
+        let err = client.complete("hi").await.unwrap_err();
+        assert!(
+            matches!(err, LlmError::Rejected { status: 402, .. }),
+            "got {err:?}"
+        );
+        // One attempt, no 500ms/1000ms backoff sleeps.
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "4xx must fail fast, took {:?}",
+            start.elapsed()
+        );
+        let _ = server.await;
     }
 
     // A client whose only profile points at a closed local port: every

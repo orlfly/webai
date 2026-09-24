@@ -16,6 +16,7 @@ use std::sync::Arc;
 use webai_agent::runtime::{self, LaunchMode, LaunchOutcome, RuntimeError};
 
 fn main() {
+    init_tracing();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let mut mode = LaunchMode::Tui;
@@ -103,6 +104,17 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Minimal structured logging: warn-only by default (LLM fallbacks, startup
+/// issues); `RUST_LOG=info` (or debug) reveals llm calls and runtime details.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 fn print_help() {

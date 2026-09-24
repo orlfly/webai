@@ -20,6 +20,7 @@ webai-tui = { path = "../../crates/webai-tui" }
 webai-webkit = { path = "../../crates/webai-webkit" }
 webai-bridge = { path = "../../crates/webai-bridge" }
 tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 # Real WPE backend (legacy_cpp chain). Default build stays pure Rust.
