@@ -432,14 +432,24 @@ impl AgentRunner {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let mode = if exec.browser_connected() {
-            "已接入真实浏览器"
+        let (mode, executed_note) = if exec.browser_connected() {
+            (
+                "已接入真实浏览器",
+                "步骤已在真实浏览器中实际执行",
+            )
         } else {
-            "开发模式（未接入真实浏览器）"
+            (
+                "开发模式（未接入真实浏览器）",
+                "上面的 [动词] 行只是生成的调用参数/目标，并未真正执行（页面未打开、内容未读取）",
+            )
         };
         let ask = format!(
-            "你是 webai 浏览器助手。用户说：{prompt}\n已执行步骤：\n{transcript}\n当前：{mode}。\n\
-             请用中文简明回答用户；若用户要求读取/总结页面而当前未接入真实浏览器，请如实说明无法读取页面内容。\
+            "你是 webai 浏览器助手。\n用户说：{prompt}\n已规划步骤：\n{transcript}\n\
+             状态：{mode}。{executed_note}。\n\
+             请用中文简明回答用户，并严格遵守：\n\
+             - 若为开发模式，必须明确说明步骤未实际执行，例如“已生成打开百度的参数（https://…），但未实际打开页面”；\n\
+             - 严禁谎称页面已打开、内容已读取或已总结成功；\n\
+             - 已接入真实浏览器时，正常汇报真实执行结果。\n\
              直接给出回答，不要复述步骤清单。"
         );
         match llm.complete(&ask).await {
@@ -817,7 +827,13 @@ mod tests {
             }),
         ));
         let exec = BridgeToolExecutor::new(bridge);
-        assert!(exec.browser_connected(), "bridge executor drives the browser");
+        // Canned backend = no real browser behind it; browser_connected must
+        // report the ACTUAL availability (false), which is exactly the honesty
+        // the final answer relies on.
+        assert!(
+            !exec.browser_connected(),
+            "canned backend must not claim a real browser"
+        );
 
         // Model-composed JSON args drive the bridge end to end.
         let (ok, obs) = exec
