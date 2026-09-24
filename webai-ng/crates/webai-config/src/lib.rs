@@ -190,7 +190,13 @@ pub fn load_from(config_dir: &Path) -> Result<LoadedConfig, ConfigError> {
     // agent.toml — fail-fast.
     let agent = read_required::<AgentConfig>(config_dir, AGENT_FILE)?;
     // llm.toml — fail-fast.
-    let llm = read_required::<LlmConfig>(config_dir, LLM_FILE)?;
+    let llm_path = config_dir.join(LLM_FILE);
+    let llm_raw = std::fs::read_to_string(&llm_path)
+        .map_err(|_| ConfigError::Missing(llm_path.display().to_string()))?;
+    let llm = toml::from_str::<LlmConfig>(&llm_raw).map_err(|e| ConfigError::Parse {
+        path: llm_path.clone(),
+        detail: format!("{e}{}", dotted_table_hint(&llm_raw)),
+    })?;
 
     // Validate the agent's llm profile reference.
     if !agent.llm.is_empty() && !llm.profiles.contains_key(&agent.llm) {
@@ -221,6 +227,31 @@ fn read_required<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> Result
         path: path.clone(),
         detail: e.to_string(),
     })
+}
+
+/// If `raw` declares a top-level profile table whose name contains a dot and
+/// is not quoted (e.g. `[glm-5.3-flash]`), TOML reads the dots as nested-table
+/// syntax, the profile never materializes, and the failure reads as a cryptic
+/// "missing field `model`". Detect it and tell the user to quote the name:
+/// `["glm-5.3-flash"]`.
+fn dotted_table_hint(raw: &str) -> String {
+    for line in raw.lines() {
+        let line = line.trim();
+        let name = line
+            .strip_prefix('[')
+            .and_then(|l| l.strip_suffix(']'))
+            .filter(|l| !l.starts_with("[["));
+        if let Some(name) = name {
+            let quoted = name.starts_with('"') && name.ends_with('"');
+            if !quoted && name.contains('.') {
+                return format!(
+                    "\n\nhint: profile table name `{name}` contains a dot; TOML reads it as \
+                     nested tables — quote it as `[\"{name}\"]`"
+                );
+            }
+        }
+    }
+    String::new()
 }
 
 /// Read and parse an optional file; missing or corrupt returns `None` (degrade).
@@ -357,6 +388,37 @@ endpoint = "/v1/chat/completions"
         write(&dir, LLM_FILE, "[deepseek-v4-flash]\nmodel = \"m\"\n");
         let err = load_from(&dir).unwrap_err();
         assert!(matches!(err, ConfigError::UnknownLlmProfile(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dotted_profile_table_name_yields_quoting_hint_and_parses_quoted() {
+        let dir = temp_dir();
+        write(&dir, AGENT_FILE, "llm = \"glm-5.3-flash\"\n");
+        // Unquoted dotted name: TOML nests it, the profile is lost, and the
+        // failure must hint at quoting instead of a bare "missing field model".
+        write(
+            &dir,
+            LLM_FILE,
+            "[glm-5.3-flash]\nmodel = \"m\"\nbase_url = \"http://localhost:11434\"\n\
+             endpoint = \"/v1/chat/completions\"\napi_key = \"k\"\n",
+        );
+        let err = load_from(&dir).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("hint:") && text.contains("[\"glm-5.3-flash\"]"),
+            "got: {text}"
+        );
+
+        // Quoted table name parses and the profile resolves.
+        write(
+            &dir,
+            LLM_FILE,
+            "[\"glm-5.3-flash\"]\nmodel = \"m\"\nbase_url = \"http://localhost:11434\"\n\
+             endpoint = \"/v1/chat/completions\"\napi_key = \"k\"\n",
+        );
+        let cfg = load_from(&dir).unwrap();
+        assert!(cfg.llm.profiles.contains_key("glm-5.3-flash"));
         let _ = fs::remove_dir_all(&dir);
     }
 
