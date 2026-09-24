@@ -14,7 +14,7 @@
 use webai_llm::LlmClient;
 use webai_memory::{ScriptMemoryEntry, SharedMemoryStore};
 
-use super::plan_loop::{infer_target, infer_verb, requires_plan, LoopError, LoopGuards};
+use super::plan_loop::{infer_target, plan_verbs, requires_plan, LoopError, LoopGuards};
 use super::script_memory::ScriptMemory;
 use super::summariser::{HistorySummariser, Turn};
 
@@ -186,6 +186,22 @@ impl ToolExecutor for BridgeToolExecutor {
     }
 }
 
+/// The required tool-argument shape for `verb` — fed to the model so composed
+/// args always carry the keys the script composer demands (real-device runs
+/// failed with "missing required argument `selector`" before this).
+fn verb_required_args(verb: &str) -> &'static str {
+    match verb {
+        "navigate" => r##"{"url": "https://example.com"}"##,
+        "click" | "hover" => r##"{"selector": "#btn"}"##,
+        "fill" => r##"{"selector": "#q", "value": "text to type"}"##,
+        "pressKey" => r##"{"key": "Enter", "selector": "#q"}"##,
+        "evaluate" => r##"{"script": "document.title"}"##,
+        "drag" => r##"{"source": "#a", "target": "#b"}"##,
+        "download" => r##"{"url": "https://example.com/f.bin", "filename": "f.bin"}"##,
+        _ => "{}",
+    }
+}
+
 /// Strip a markdown ```json ... ``` code fence around a composed script.
 fn strip_json_fence(text: &str) -> String {
     let t = text.trim();
@@ -353,8 +369,14 @@ impl AgentRunner {
             };
             let _ = self.memory.remember(entry);
 
-            // Deterministic stop: a plan runs 3 steps, a single-shot 1 step.
-            let target = if plan_injected { 3 } else { 1 };
+            // Deterministic stop: a plan runs one step per distinct verb the
+            // prompt asked for (never two identical verbs back-to-back, which
+            // would trip the duplicate-observation guard); single-shot 1 step.
+            let target = if plan_injected {
+                plan_verbs(prompt).len().max(1)
+            } else {
+                1
+            };
             if steps.len() >= target {
                 break StepOutcome::Done {
                     state: "done".into(),
@@ -433,10 +455,12 @@ impl AgentRunner {
         self.llm_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let target = infer_target(prompt, verb);
+        let required = verb_required_args(verb);
         let model_prompt = format!(
             "Output ONLY a JSON object with the tool arguments for the bridge \
              verb `{verb}` to accomplish this: {prompt}. \
-             Example for navigate: {{\"url\":\"https://example.com\"}}"
+             `{verb}` REQUIRES args of exactly this shape: {required}. \
+             Provide all required keys, no prose."
         );
         let composed = match llm.complete(&model_prompt).await {
             Ok(text) if !text.trim().is_empty() => {
@@ -465,10 +489,11 @@ impl AgentRunner {
     /// Verb selection for the loop: step 0 derives from the prompt; later plan
     /// steps follow the canonical multi-step chain.
     fn next_verb(&self, index: usize, prompt: &str) -> String {
-        match index {
-            0 => infer_verb(prompt).to_string(),
-            1 => "click".to_string(),
-            _ => "getText".to_string(),
+        let verbs = plan_verbs(prompt);
+        if index < verbs.len() {
+            verbs[index].clone()
+        } else {
+            "getText".to_string()
         }
     }
 
@@ -538,6 +563,23 @@ mod tests {
         assert!(matches!(outcome, StepOutcome::Done { .. }));
         assert_eq!(steps.len(), 3);
         assert_eq!(steps[0].tool_name, "navigate");
+    }
+
+    #[tokio::test]
+    async fn plan_chain_follows_prompt_verbs_after_first() {
+        let (r, _s) = runner(true);
+        let exec = StubExecutor::default();
+        let llm = LlmClient::with_profile_stub("stub");
+        // "打开...然后读取...最后总结" -> the loop must sequence navigate then
+        // getText (not a hardcoded click) so real-device plans don't emit a
+        // pointless click between navigation and read.
+        let (steps, _outcome, plan) = r
+            .run("先打开百度，然后读取页面内容，最后总结", &exec, &llm)
+            .await;
+        assert!(plan);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].tool_name, "navigate");
+        assert_eq!(steps[1].tool_name, "getText");
     }
 
     #[tokio::test]

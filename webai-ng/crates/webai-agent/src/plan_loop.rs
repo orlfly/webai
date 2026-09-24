@@ -302,11 +302,63 @@ pub fn infer_verb(prompt: &str) -> &'static str {
     }
     let lower = prompt.to_lowercase();
     for (kw, verb) in VERB_KEYWORDS {
-        if lower.contains(kw) {
+        if contains_keyword(&lower, kw) {
             return verb;
         }
     }
     "getText"
+}
+
+/// The ordered, distinct verbs a prompt asks for (used to sequence the plan
+/// chain: "打开 A 然后读取 B" -> [navigate, getText], so the loop's later
+/// steps follow the prompt instead of a fixed navigate/click/getText chain).
+pub fn plan_verbs(prompt: &str) -> Vec<String> {
+    if prompt.trim().is_empty() {
+        return vec!["navigate".into()];
+    }
+    let lower = prompt.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    for (kw, verb) in VERB_KEYWORDS {
+        if contains_keyword(&lower, kw) && !out.iter().any(|v| v == verb) {
+            out.push(verb.to_string());
+        }
+    }
+    if out.is_empty() {
+        vec!["getText".into()]
+    } else {
+        out
+    }
+}
+
+/// Keyword match with ASCII word boundaries: a prompt like
+/// `http://127.0.0.1/static.html` must NOT count the URL suffix as the
+/// `html` verb, and `plugin` must not match `in`. CJK keywords match
+/// verbatim (no word structure to respect).
+fn contains_keyword(lower: &str, kw: &str) -> bool {
+    let ascii_kw = kw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b' ');
+    if !ascii_kw {
+        return lower.contains(kw);
+    }
+    let lower = lower.as_bytes();
+    let kw = kw.as_bytes();
+    let mut start = 0;
+    while let Some(idx) = lower[start..]
+        .windows(kw.len())
+        .position(|w| w == kw)
+    {
+        let abs = start + idx;
+        let before_ok = abs == 0
+            || !(lower[abs - 1].is_ascii_alphanumeric()
+                || matches!(lower[abs - 1], b'_' | b'-' | b'.'));
+        let end = abs + kw.len();
+        let after_ok = end == lower.len()
+            || !(lower[end].is_ascii_alphanumeric() || matches!(lower[end], b'_' | b'-'));
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
 }
 
 /// Extract the human-readable target of `verb` from a (possibly chained)
@@ -584,6 +636,26 @@ mod tests {
         assert_eq!(infer_verb("open example.com"), "navigate");
         assert_eq!(infer_verb("hello"), "getText");
         assert_eq!(infer_verb(""), "navigate");
+    }
+
+    #[test]
+    fn plan_verbs_orders_prompt_verbs() {
+        assert_eq!(plan_verbs("打开百度"), vec!["navigate".to_string()]);
+        assert_eq!(
+            plan_verbs("先打开百度，然后读取页面内容，最后总结"),
+            vec!["navigate".to_string(), "getText".to_string()]
+        );
+        assert_eq!(
+            plan_verbs("先打开百度，然后点击搜索，最后汇总结果"),
+            vec!["navigate".to_string(), "click".to_string(), "getText".to_string()]
+        );
+        assert_eq!(plan_verbs("hello"), vec!["getText".to_string()]);
+        assert_eq!(plan_verbs(""), vec!["navigate".to_string()]);
+        // A URL suffix .html must NOT count as the getHtml verb.
+        assert_eq!(
+            plan_verbs("打开 http://127.0.0.1:18981/static.html 读取内容"),
+            vec!["navigate".to_string(), "getText".to_string()]
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ pub mod summariser;
 pub mod tools;
 
 pub use plan_loop::{
-    infer_target, infer_verb, requires_plan, LoopError, LoopGuards, PLAN_DIRECTIVE,
+    infer_target, infer_verb, plan_verbs, requires_plan, LoopError, LoopGuards, PLAN_DIRECTIVE,
     STATE_BLOCK_MARKER,
 };
 pub use runner::{
