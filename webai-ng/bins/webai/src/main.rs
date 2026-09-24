@@ -313,14 +313,36 @@ fn run(
 /// `BridgeToolExecutor` dispatches agent steps through webai-script compose ->
 /// WebKit FFI); the default pure-Rust build uses the prompt-truthful echo
 /// executor (no FFI in the dev machine).
+///
+/// The startup banner makes the active backend explicit, so a "开发模式"
+/// answer is never a surprise: default build -> dev-echo; real_backend build
+/// with a working WPE display -> real-wpe; real_backend build whose WPE launch
+/// failed -> a loud warning plus graceful fallback to the echo executor.
 #[cfg(feature = "real_backend")]
 fn build_executor() -> Arc<dyn webai_agent::runner::ToolExecutor> {
     use webai_agent::runner::BridgeToolExecutor;
-    let bridge = webai_bridge::Bridge::new(webai_webkit::WebkitBridge::new());
-    Arc::new(BridgeToolExecutor::new(Arc::new(bridge)))
+    let webkit = webai_webkit::WebkitBridge::new();
+    if webkit.is_ffi_available() {
+        eprintln!(
+            "webai: browser backend: real-wpe (FFI; WPE_BACKEND={})",
+            std::env::var("WPE_BACKEND").unwrap_or_else(|_| "<unset>".into())
+        );
+        let bridge = webai_bridge::Bridge::new(webkit);
+        Arc::new(BridgeToolExecutor::new(Arc::new(bridge)))
+    } else {
+        eprintln!(
+            "webai: ERROR real_backend build but WPE/FFI unavailable (launch \
+             failed or no display); falling back to dev-echo executor"
+        );
+        Arc::new(webai_agent::runner::EchoExecutor)
+    }
 }
 
 #[cfg(not(feature = "real_backend"))]
 fn build_executor() -> Arc<dyn webai_agent::runner::ToolExecutor> {
+    eprintln!(
+        "webai: browser backend: dev-echo (default build; rebuild with \
+         `--features real_backend` to drive the real WPE browser)"
+    );
     Arc::new(webai_agent::runner::EchoExecutor)
 }

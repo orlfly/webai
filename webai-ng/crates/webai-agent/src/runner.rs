@@ -182,7 +182,10 @@ impl ToolExecutor for BridgeToolExecutor {
     }
 
     fn browser_connected(&self) -> bool {
-        true
+        // Honest per-run: WebkitBridge::new() attempts the real cog/WPE launch
+        // at construction; report the ACTUAL availability so answers never
+        // claim a browser that failed to start this session.
+        self.bridge.webkit().is_ffi_available()
     }
 }
 

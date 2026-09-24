@@ -3,6 +3,8 @@ AGENTS.md
 .env
 /webai-ng/target/
 /target/
+# Alternative CARGO_TARGET_DIR builds (e.g. target-real for real_backend).
+/webai-ng/target-*/
 
 # Download test artifacts
 webai-ng/crates/webai-bridge/downloads/
