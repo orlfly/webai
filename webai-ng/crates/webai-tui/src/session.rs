@@ -285,11 +285,12 @@ impl RunnerPromptHandler {
             });
         }
         match &result.1 {
-            StepOutcome::Done { state, message } => {
-                let _ = (state, message);
-                emit(SessionEvent::Done {
-                    state: crate::done_state(Ok(())),
-                });
+            StepOutcome::Done { message, .. } => {
+                let mut st = crate::done_state(Ok(()));
+                // The runner's final conversational answer rides the Done
+                // message so the TUI can render it as the last AI line.
+                st.message = message.clone();
+                emit(SessionEvent::Done { state: st });
                 Ok(())
             }
             StepOutcome::Guard(err) => Err(format!("guard: {err}")),

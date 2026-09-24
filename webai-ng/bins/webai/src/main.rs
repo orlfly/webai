@@ -224,23 +224,32 @@ fn run(
                         tokio::select! {
                             ev = backend.events().recv() => {
                                 let Some(ev) = ev else { break };
-                                let ui = match ev {
+                                let uis: Vec<webai_tui::UiEvent> = match ev {
                                     webai_tui::SessionEvent::Step { step } => {
-                                        webai_tui::UiEvent::Delta(match step.observation {
-                                            Some(obs) => format!("[{}] {}", step.tool_name, obs),
-                                            None => format!("[{}]", step.tool_name),
-                                        })
+                                        // A leading newline starts a fresh AI
+                                        // line per step (the TUI coalesces
+                                        // deltas into the current line).
+                                        vec![webai_tui::UiEvent::Delta(match step.observation {
+                                            Some(obs) => format!("\n[{}] {}", step.tool_name, obs),
+                                            None => format!("\n[{}]", step.tool_name),
+                                        })]
                                     }
                                     webai_tui::SessionEvent::Done { state } => {
-                                        webai_tui::UiEvent::Finished(
-                                            state.message.unwrap_or_else(|| state.status),
-                                        )
+                                        let status = state.status.clone();
+                                        let mut uis = Vec::new();
+                                        if let Some(msg) = state.message {
+                                            uis.push(webai_tui::UiEvent::Delta(format!("\n{msg}")));
+                                        }
+                                        uis.push(webai_tui::UiEvent::Finished(status));
+                                        uis
                                     }
                                     webai_tui::SessionEvent::Error { message } => {
-                                        webai_tui::UiEvent::Finished(format!("error: {message}"))
+                                        vec![webai_tui::UiEvent::Finished(format!("error: {message}"))]
                                     }
                                 };
-                                if ui_tx.send(ui).await.is_err() { break; }
+                                for ui in uis {
+                                    if ui_tx.send(ui).await.is_err() { break; }
+                                }
                             }
                             cmd = hold_rx.recv() => {
                                 let Some(cmd) = cmd else { break };

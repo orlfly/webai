@@ -69,14 +69,25 @@ impl App {
     }
 
     /// Feed one streaming text delta: append to the last assistant line (or
-    /// start one). This is the "streaming not whole message" path.
+    /// start one). This is the "streaming not whole message" path. A leading
+    /// `\n` starts a fresh assistant line (used to separate tool steps and the
+    /// final answer); a bare `\n` trailer is a separator, not a visible line.
     pub fn push_stream_delta(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
         }
-        match self.lines.last_mut() {
-            Some(ChatLine::Assistant(t)) => t.push_str(delta),
-            _ => self.lines.push(ChatLine::Assistant(delta.to_string())),
+        let mut parts = delta.split('\n');
+        let first = parts.next().unwrap_or("");
+        if !first.is_empty() {
+            match self.lines.last_mut() {
+                Some(ChatLine::Assistant(t)) => t.push_str(first),
+                _ => self.lines.push(ChatLine::Assistant(first.to_string())),
+            }
+        }
+        for rest in parts {
+            if !rest.is_empty() {
+                self.lines.push(ChatLine::Assistant(rest.to_string()));
+            }
         }
         self.dirty = true;
     }
@@ -356,6 +367,27 @@ mod tests {
         // One assistant line holding the partial text so far (not three lines).
         assert_eq!(app.lines.len(), 1);
         assert!(matches!(app.lines[0], ChatLine::Assistant(ref t) if t == "你好，世"));
+    }
+
+    #[test]
+    fn newline_deltas_separate_tool_steps_and_final_answer() {
+        let mut app = App::default();
+        app.push_stream_delta("\n[navigate] https://www.baidu.com");
+        app.push_stream_delta("\n[click] #su");
+        app.push_stream_delta("\n已打开百度首页。");
+        assert_eq!(app.lines.len(), 3);
+        assert_eq!(
+            app.lines[0],
+            ChatLine::Assistant("[navigate] https://www.baidu.com".to_string())
+        );
+        assert_eq!(
+            app.lines[1],
+            ChatLine::Assistant("[click] #su".to_string())
+        );
+        assert_eq!(
+            app.lines[2],
+            ChatLine::Assistant("已打开百度首页。".to_string())
+        );
     }
 
     #[test]

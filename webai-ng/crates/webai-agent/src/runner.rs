@@ -72,6 +72,12 @@ impl Default for RunConfig {
 pub trait ToolExecutor: Send + Sync {
     /// Execute a single `verb` tool action with `args`. Returns `(ok, obs)`.
     async fn execute(&self, verb: &str, args: &str) -> (bool, String);
+    /// Whether this executor can drive a real browser. The final-answer pass
+    /// uses this to stay truthful about reads (dev builds must say "cannot
+    /// actually read the page", not pretend `body` is content).
+    fn browser_connected(&self) -> bool {
+        false
+    }
 }
 
 /// A trivial executor for tests that always succeeds.
@@ -116,7 +122,7 @@ impl ToolExecutor for EchoExecutor {
         let text = if let Ok(json) = serde_json::from_str::<serde_json::Value>(script) {
             // Model-composed JSON tool args: prefer a readable field, else the
             // compact JSON (honest view of what the model chose).
-            ["url", "selector", "value", "script", "key"]
+            ["url", "selector", "value", "text", "script", "key"]
                 .iter()
                 .find_map(|k| json.get(*k).and_then(|v| v.as_str()).map(str::to_owned))
                 .unwrap_or_else(|| {
@@ -174,6 +180,21 @@ impl ToolExecutor for BridgeToolExecutor {
             Err(e) => (false, e.to_string()),
         }
     }
+
+    fn browser_connected(&self) -> bool {
+        true
+    }
+}
+
+/// Strip a markdown ```json ... ``` code fence around a composed script.
+fn strip_json_fence(text: &str) -> String {
+    let t = text.trim();
+    let body = t
+        .strip_prefix("```json")
+        .or_else(|| t.strip_prefix("```"))
+        .unwrap_or(t)
+        .trim();
+    body.strip_suffix("```").unwrap_or(body).trim().to_owned()
 }
 
 /// Map the driver's camelCase verb names to the protocol wire names.
@@ -273,7 +294,7 @@ impl AgentRunner {
         let mut guards = LoopGuards::new(self.config.max_steps, self.config.duplicate_threshold);
         let mut last_observation: Option<String> = None;
 
-        let outcome = loop {
+        let mut outcome = loop {
             // Guard: max steps.
             if guards.advance_step().is_err() {
                 break StepOutcome::Guard(LoopError::MaxStepsExceeded {
@@ -348,7 +369,58 @@ impl AgentRunner {
             last_observation = Some(observation);
         };
 
+        // Final answer: convert the executed step transcript into one
+        // conversational reply (the TUI renders it as the last AI line). One
+        // LLM call per turn; a stub/unreachable model falls back to a
+        // truthful summary so the turn still completes.
+        if let StepOutcome::Done { message, .. } = &mut outcome {
+            let answer = self.compose_answer(prompt, &steps, exec, llm).await;
+            *message = Some(answer);
+        }
+
         (steps, outcome, plan_injected)
+    }
+
+    /// Compose a conversational final answer from the executed steps. Tells
+    /// the model the browser connection state so read/summarize requests are
+    /// answered truthfully (a dev build cannot actually return page content).
+    async fn compose_answer(
+        &self,
+        prompt: &str,
+        steps: &[AgentStep],
+        exec: &dyn ToolExecutor,
+        llm: &LlmClient,
+    ) -> String {
+        if steps.is_empty() {
+            return "没有执行任何步骤。".to_string();
+        }
+        self.llm_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let transcript = steps
+            .iter()
+            .map(|s| {
+                format!(
+                    "[{}] {}",
+                    s.tool_name,
+                    s.observation.as_deref().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mode = if exec.browser_connected() {
+            "已接入真实浏览器"
+        } else {
+            "开发模式（未接入真实浏览器）"
+        };
+        let ask = format!(
+            "你是 webai 浏览器助手。用户说：{prompt}\n已执行步骤：\n{transcript}\n当前：{mode}。\n\
+             请用中文简明回答用户；若用户要求读取/总结页面而当前未接入真实浏览器，请如实说明无法读取页面内容。\
+             直接给出回答，不要复述步骤清单。"
+        );
+        match llm.complete(&ask).await {
+            Ok(text) if !text.trim().is_empty() => text.trim().to_owned(),
+            _ => format!("已执行 {} 步：\n{transcript}", steps.len()),
+        }
     }
 
     /// Consume one LLM call (counted) and return `(call_count, composed)`.
@@ -367,7 +439,17 @@ impl AgentRunner {
              Example for navigate: {{\"url\":\"https://example.com\"}}"
         );
         let composed = match llm.complete(&model_prompt).await {
-            Ok(text) if !text.trim().is_empty() => text.trim().to_owned(),
+            Ok(text) if !text.trim().is_empty() => {
+                // Models often wrap the JSON in a ```json fence; strip it so
+                // both executors can parse the args (BridgeToolExecutor needs
+                // real JSON for the browser call).
+                let cleaned = strip_json_fence(&text);
+                if serde_json::from_str::<serde_json::Value>(&cleaned).is_ok() {
+                    cleaned
+                } else {
+                    text.trim().to_owned()
+                }
+            }
             Ok(_) => format!("{verb}({target})"),
             Err(e) => {
                 tracing::warn!(
@@ -605,6 +687,41 @@ mod tests {
     }
 
     #[test]
+    fn done_carries_final_answer_and_dev_echo_reports_no_browser() {
+        let (r, _s) = runner(true);
+        let llm = LlmClient::with_profile_stub("stub");
+        let echo = EchoExecutor;
+        assert!(!echo.browser_connected(), "dev executor must be honest");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (_steps, outcome, _plan) = rt.block_on(r.run("打开百度", &echo, &llm));
+        let msg = match outcome {
+            StepOutcome::Done { message, .. } => message.unwrap_or_default(),
+            other => panic!("expected done, got {other:?}"),
+        };
+        // Stub LLM -> truthful fallback summary, never empty.
+        assert!(!msg.is_empty(), "final answer must be present");
+        assert!(
+            msg.contains("navigate") && msg.contains("百度"),
+            "answer must reference the executed step, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn strip_json_fence_removes_markdown_wrappers() {
+        assert_eq!(
+            strip_json_fence("```json\n{\"url\":\"https://a.b\"}\n```"),
+            "{\"url\":\"https://a.b\"}"
+        );
+        assert_eq!(strip_json_fence("{\"url\":\"x\"}"), "{\"url\":\"x\"}");
+        assert_eq!(
+            strip_json_fence("```json {\"url\":\"x\"} ```"),
+            "{\"url\":\"x\"}"
+        );
+        // Prose is not JSON; the raw text stays for the honest observation.
+        assert_eq!(strip_json_fence("just prose"), "just prose");
+    }
+
+    #[test]
     fn compose_args_fallback_handles_matrix_json_and_verb_parens() {
         use webai_protocol::BrowserVerb;
         // Matrix syntax `key=value` inside verb(...) (rss_sample's prompt).
@@ -655,6 +772,7 @@ mod tests {
             }),
         ));
         let exec = BridgeToolExecutor::new(bridge);
+        assert!(exec.browser_connected(), "bridge executor drives the browser");
 
         // Model-composed JSON args drive the bridge end to end.
         let (ok, obs) = exec
